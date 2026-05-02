@@ -1,9 +1,13 @@
 """
-Reward heads of the form r(h) = phi(w^T h + b).
+Reward heads of the form:
+    r(h) = mean_k(phi(fc2(leaky_relu(fc1(h))))) + b_out
 
-The preactivation z = w^T h + b is a scalar. phi is a learned activation
-applied to that scalar. Concavity in h is guaranteed when phi is concave
-in z, because z is affine in h.
+fc1: Linear(hidden_size → intermediate_size)
+LeakyReLU (non-linearity between layers)
+fc2: Linear(intermediate_size → head_width)
+phi: element-wise concave activation applied to each of the head_width units
+mean: average over the head_width dimension → scalar per example
+b_out: learned scalar bias
 
 Activations included:
     Ident          : phi(z) = z. Linear baseline (weakly concave).
@@ -14,8 +18,6 @@ Activations included:
                       by 0. Non-monotonic for z > 0.
     Bounded        : phi(z) = alpha * tanh(z). Monotonic, bounded in
                      (-alpha, +alpha), but only one-sided concavity.
-                     Useful as a comparison: tests whether saturation
-                     in the high-reward regime alone suffices.
 
 All learned positive parameters are softplus(theta) for raw learnable theta.
 """
@@ -60,8 +62,14 @@ class BoundedAbove(nn.Module):
 class GeluBoundedAbove(nn.Module):
     """phi(z) = -alpha * GELU(z), alpha = softplus(a) > 0.
     
-    Concave (since GELU is approximately convex). Bounded above by 0
-    at z = 0. NOT monotonic: phi decreases as z grows past 0.
+    NOT globally concave: GELU has a small non-convex region near
+    z ~ -0.75, so -GELU has a corresponding non-concave region. Concave
+    on most of R but not all.
+    
+    Bounded above by 0 (achieved at z = 0). NOT monotonic: phi decreases
+    as z grows past 0.
+    
+    Useful as a comparison head; see Bounded for one-sided concavity case.
     """
     def __init__(self):
         super().__init__()
@@ -99,7 +107,7 @@ ACTIVATION_REGISTRY: dict[str, type] = {
 GLOBALLY_CONCAVE: dict[str, bool] = {
     "ident": True,                 # weakly (affine)
     "bounded_above": True,
-    "gelu_bounded_above": True,
+    "gelu_bounded_above": False,   # GELU has a small non-convex region near z=-0.75
     "bounded": False,              # one-sided
 }
 
@@ -107,7 +115,7 @@ GLOBALLY_CONCAVE: dict[str, bool] = {
 STRICTLY_CONCAVE: dict[str, bool] = {
     "ident": False,
     "bounded_above": True,
-    "gelu_bounded_above": True,
+    "gelu_bounded_above": False,
     "bounded": False,
 }
 
@@ -123,19 +131,25 @@ MONOTONIC: dict[str, bool] = {
 # ---------- The head module ----------
 
 class RewardHead(nn.Module):
-    """Reward head: r(h) = phi(w^T h + b).
-    
+    """Reward head: Linear → LeakyReLU → Linear → ConcaveActivation → mean → +bias.
+
+    r(h) = mean_k(phi(fc2(leaky_relu(fc1(h))))) + b_out
+
     Args:
         hidden_size: dimension of input hidden state h.
         activation_name: key into ACTIVATION_REGISTRY.
-        init_scale: stddev of Gaussian init for w.
-        init_bias: initial value of b.
+        intermediate_size: width of the hidden layer; defaults to hidden_size.
+        head_width: number of parallel output units before mean pooling (k).
+        init_scale: stddev of Gaussian init for fc1/fc2 weights.
+        init_bias: initial value of output bias b_out.
     """
-    
+
     def __init__(
         self,
         hidden_size: int,
         activation_name: str = "bounded_above",
+        intermediate_size: int | None = None,
+        head_width: int = 32,
         init_scale: float = 0.02,
         init_bias: float = 0.0,
     ):
@@ -147,29 +161,29 @@ class RewardHead(nn.Module):
             )
         self.activation_name = activation_name
         self.hidden_size = hidden_size
-        
-        self.linear = nn.Linear(hidden_size, 1, bias=True)
-        nn.init.normal_(self.linear.weight, mean=0.0, std=init_scale)
-        nn.init.constant_(self.linear.bias, init_bias)
-        
+        self.intermediate_size = hidden_size if intermediate_size is None else intermediate_size
+        self.head_width = head_width
+
+        self.fc1 = nn.Linear(hidden_size, self.intermediate_size)
+        self.fc2 = nn.Linear(self.intermediate_size, head_width)
         self.activation = ACTIVATION_REGISTRY[activation_name]()
-    
+        self.output_bias = nn.Parameter(torch.tensor(float(init_bias)))
+
+        nn.init.normal_(self.fc1.weight, std=init_scale)
+        nn.init.zeros_(self.fc1.bias)
+        nn.init.normal_(self.fc2.weight, std=init_scale)
+        nn.init.zeros_(self.fc2.bias)
+
     def preactivation(self, h: torch.Tensor) -> torch.Tensor:
-        """z = w^T h + b. Shape: (batch, 1)."""
-        return self.linear(h)
-    
+        """z = fc2(leaky_relu(fc1(h))). Shape: (batch, head_width)."""
+        return self.fc2(F.leaky_relu(self.fc1(h)))
+
     def forward(self, h: torch.Tensor) -> torch.Tensor:
-        """r = phi(w^T h + b). Shape: (batch, 1)."""
-        return self.activation(self.preactivation(h))
-    
-    @property
-    def w(self) -> torch.Tensor:
-        return self.linear.weight.squeeze(0)
-    
-    @property
-    def b(self) -> torch.Tensor:
-        return self.linear.bias.squeeze()
-    
+        """r = mean_k(phi(z)) + b_out. Shape: (batch, 1)."""
+        z = self.preactivation(h)                      # (batch, head_width)
+        r = self.activation(z)                         # (batch, head_width)
+        return r.mean(dim=-1, keepdim=True) + self.output_bias  # (batch, 1)
+
     def num_extra_params(self) -> int:
-        """Parameter count of the activation beyond w, b."""
+        """Parameter count of the activation beyond fc1/fc2/output_bias."""
         return sum(p.numel() for p in self.activation.parameters())

@@ -36,6 +36,8 @@ class TrainConfig:
     activation_name: str = "bounded_above"
     head_init_scale: float = 0.02
     head_init_bias: float = 0.0
+    head_width: int = 32
+    head_intermediate_size: int | None = None  # None -> use base hidden_size
     
     # LoRA
     lora_r: int = 8
@@ -91,6 +93,8 @@ def build_model_and_tokenizer(cfg: TrainConfig):
         activation_name=cfg.activation_name,
         head_init_scale=cfg.head_init_scale,
         head_init_bias=cfg.head_init_bias,
+        head_width=cfg.head_width,
+        head_intermediate_size=cfg.head_intermediate_size,
     )
     model = RewardModel.from_base_model(
         rm_config,
@@ -209,8 +213,20 @@ def main():
     
     print()
     print("Training done. Saving final model...")
-    trainer.save_model(os.path.join(cfg.output_dir, "final"))
-    print(f"Saved to {cfg.output_dir}/final")
+    final_dir = os.path.join(cfg.output_dir, "final")
+    trainer.save_model(final_dir)
+    
+    # Save the full config so evaluate.py can reconstruct the model exactly.
+    # Without this, evaluate.py uses RewardModelConfig defaults which may
+    # not match what was trained, causing checkpoint shape mismatches.
+    import json
+    config_path = os.path.join(final_dir, "rm_train_config.json")
+    with open(config_path, "w") as f:
+        # Don't serialize the lora_target_modules list type if it's anything
+        # weird; convert everything via dataclasses.asdict.
+        json.dump(dataclasses.asdict(cfg), f, indent=2)
+    print(f"Saved model to {final_dir}")
+    print(f"Saved config to {config_path}")
 
 
 if __name__ == "__main__":

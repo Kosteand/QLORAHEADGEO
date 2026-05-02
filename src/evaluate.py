@@ -33,6 +33,7 @@ from peft import PeftModel
 from transformers import AutoTokenizer
 
 from .data import load_ultrafeedback
+from .heads import RewardHead
 from .model import RewardModel, RewardModelConfig
 
 
@@ -117,7 +118,6 @@ def standard_eval(model, tokenizer, dataset, batch_size: int = 8) -> dict:
     }
 
 
-@torch.no_grad()
 def runaway_diagnostic(
     model,
     tokenizer,
@@ -126,92 +126,83 @@ def runaway_diagnostic(
     t_range: tuple[float, float] = (-5.0, 20.0),
     n_steps: int = 50,
 ) -> dict:
-    """Probe reward along +w direction in hidden space.
-    
-    For each example, we:
-    1. Compute its hidden state h.
-    2. Compute reward at h + t * w_unit for t in [t_min, t_max].
-    3. Aggregate the reward curves.
-    
-    For the LINEAR head, this should be a straight line: r grows
-    linearly with t and is unbounded.
-    
-    For a CONCAVE head, the curve should turn over: marginal reward
-    diminishes and r approaches an asymptote.
-    
+    """Probe reward along the steepest-ascent direction in hidden space.
+
+    For each example we:
+    1. Compute its pooled hidden state h.
+    2. Compute g = ∇_h r(h) (the steepest-ascent direction).
+    3. Probe r(h + t * g/||g||) for t in [t_min, t_max].
+    4. Aggregate the reward curves.
+
+    For the linear head, g = w everywhere, so this reduces to the
+    original w-direction probe. For the MLP head, g varies per example
+    but still measures how far the reward can grow as we move in the
+    most reward-increasing direction from each training point.
+
     THIS IS THE PAPER'S HEADLINE FIGURE.
     """
     device = next(model.parameters()).device
-    
-    # Extract w from the trained head.
-    # PeftModel wraps the base model; we navigate to the actual head.
-    # The reward_head is in modules_to_save, so it lives at:
-    #   model.base_model.model.reward_head
+
+    # Find the RewardHead instance anywhere in the PEFT-wrapped model.
     head = None
-    for name, module in model.named_modules():
-        if name.endswith("reward_head") and hasattr(module, "linear"):
+    for _, module in model.named_modules():
+        if isinstance(module, RewardHead):
             head = module
             break
     if head is None:
-        raise RuntimeError("Could not find reward_head in model")
-    
-    w = head.linear.weight.detach().squeeze(0)  # (hidden_size,)
-    w_unit = w / w.norm()
-    
-    print(f"  ||w|| = {w.norm().item():.4f}, hidden_size = {w.shape[0]}")
-    
-    # Sample n_examples from dataset and compute their pooled hidden states.
+        raise RuntimeError("Could not find RewardHead in model")
+
     indices = np.random.RandomState(0).choice(
         len(dataset), size=min(n_examples, len(dataset)), replace=False
     )
-    
-    # We need access to the unwrapped model to get hidden states without
-    # applying the head. Use the chosen response from each example.
+
+    # Collect pooled hidden states from the base transformer.
     pooled_hs = []
-    for idx in indices:
-        ex = dataset[int(idx)]
-        ids = torch.tensor([ex["input_ids_chosen"]], device=device)
-        mask = torch.tensor([ex["attention_mask_chosen"]], device=device)
-        
-        # Forward through base; we need last_hidden_state pooled.
-        # Easiest path: call the wrapped model and intercept hidden state.
-        # We can use the preactivation output as a proxy: it's w^T h + b,
-        # so we can recover h's projection. But for the runaway diagnostic
-        # we actually want to perturb h and recompute, which requires h itself.
-        
-        # Use the base model directly through the PEFT wrapper:
-        base = model.base_model.model.model  # peft wrapper -> RewardModel -> AutoModel
-        out = base(input_ids=ids, attention_mask=mask, return_dict=True)
-        from .model import last_token_pool
-        h = last_token_pool(out.last_hidden_state, mask)  # (1, hidden)
-        pooled_hs.append(h.squeeze(0))
-    
+    with torch.no_grad():
+        for idx in indices:
+            ex = dataset[int(idx)]
+            ids = torch.tensor([ex["input_ids_chosen"]], device=device)
+            mask = torch.tensor([ex["attention_mask_chosen"]], device=device)
+            base = model.base_model.model.model  # peft → RewardModel → AutoModel
+            out = base(input_ids=ids, attention_mask=mask, return_dict=True)
+            from .model import last_token_pool
+            h = last_token_pool(out.last_hidden_state, mask).squeeze(0)
+            pooled_hs.append(h.detach())
+
     pooled_hs = torch.stack(pooled_hs)  # (n, hidden)
-    
-    # Sweep t across the range
+
+    # Compute the steepest-ascent direction g = ∇_h r(h) for each h.
+    # torch.enable_grad re-enables grad inside this no-grad context.
+    with torch.enable_grad():
+        h_g = pooled_hs.detach().clone().requires_grad_(True)
+        r_val = head(h_g)  # (n, 1)
+        grads = torch.autograd.grad(r_val.sum(), h_g)[0].detach()  # (n, hidden)
+
+    g_norms = grads.norm(dim=-1, keepdim=True)          # (n, 1)
+    grad_unit = grads / (g_norms + 1e-8)               # (n, hidden)
+
+    print(f"  gradient norm: mean={g_norms.mean().item():.4f}, "
+          f"std={g_norms.std().item():.4f}")
+
+    # Sweep t and evaluate r(h + t * g_unit) for each example.
     ts = torch.linspace(t_range[0], t_range[1], n_steps, device=device)
-    
-    # For each (h, t), compute r(h + t * w_unit) = phi(w^T (h + t*w_unit) + b)
-    #                                            = phi((w^T h + b) + t * ||w||)
-    # We can vectorize this completely without recomputing forward passes.
-    
-    z_base = (pooled_hs @ w + head.linear.bias.squeeze()).detach()  # (n,)
-    w_norm = w.norm()
-    
-    # z(h, t) = z_base + t * ||w||
-    z_grid = z_base.unsqueeze(1) + ts.unsqueeze(0) * w_norm  # (n, n_steps)
-    r_grid = head.activation(z_grid)  # (n, n_steps), apply activation
-    
-    r_mean = r_grid.float().mean(dim=0).cpu().numpy()  # average over examples
-    r_std = r_grid.float().std(dim=0).cpu().numpy()
-    
+    r_curves = []
+    with torch.no_grad():
+        for t in ts:
+            h_t = pooled_hs + t.item() * grad_unit  # (n, hidden)
+            r_t = head(h_t).squeeze(-1)             # (n,)
+            r_curves.append(r_t.float())
+
+    r_curves = torch.stack(r_curves, dim=1)  # (n, n_steps)
+    r_mean = r_curves.mean(dim=0).cpu().numpy()
+    r_std = r_curves.std(dim=0).cpu().numpy()
+
     return {
         "ts": ts.cpu().numpy().tolist(),
         "reward_mean": r_mean.tolist(),
         "reward_std": r_std.tolist(),
-        "w_norm": float(w_norm.item()),
-        "z_base_mean": float(z_base.float().mean().item()),
-        "z_base_std": float(z_base.float().std().item()),
+        "grad_norm_mean": float(g_norms.mean().item()),
+        "grad_norm_std": float(g_norms.std().item()),
     }
 
 

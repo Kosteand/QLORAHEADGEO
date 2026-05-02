@@ -60,6 +60,8 @@ class RewardModelConfig(PretrainedConfig):
         activation_name: str = "bounded_above",
         head_init_scale: float = 0.02,
         head_init_bias: float = 0.0,
+        head_width: int = 32,
+        head_intermediate_size: int | None = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -67,6 +69,8 @@ class RewardModelConfig(PretrainedConfig):
         self.activation_name = activation_name
         self.head_init_scale = head_init_scale
         self.head_init_bias = head_init_bias
+        self.head_width = head_width
+        self.head_intermediate_size = head_intermediate_size
 
 
 class RewardModel(PreTrainedModel):
@@ -92,6 +96,8 @@ class RewardModel(PreTrainedModel):
         self.reward_head = RewardHead(
             hidden_size=hidden_size,
             activation_name=config.activation_name,
+            intermediate_size=config.head_intermediate_size,
+            head_width=config.head_width,
             init_scale=config.head_init_scale,
             init_bias=config.head_init_bias,
         )
@@ -127,12 +133,12 @@ class RewardModel(PreTrainedModel):
         pooled = last_token_pool(hidden_states, attention_mask)
         
         if return_preactivation:
-            z = self.reward_head.preactivation(pooled)
-            r = self.reward_head.activation(z)
+            z = self.reward_head.preactivation(pooled)  # (batch, head_width)
+            r = self.reward_head(pooled)                 # (batch, 1)
             return SequenceClassifierOutputWithPast(
                 loss=None,
                 logits=r,
-                hidden_states=z,  # repurposed slot
+                hidden_states=z,  # repurposed slot; shape (batch, head_width)
             )
         else:
             r = self.reward_head(pooled)

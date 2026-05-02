@@ -87,17 +87,24 @@ def load_ultrafeedback(
         split="test_prefs",
     )
     
-    if n_train is not None:
+    # Allow skipping train tokenization for eval-only contexts.
+    skip_train = n_train is not None and n_train == 0
+    
+    if not skip_train and n_train is not None:
         train = train.select(range(min(n_train, len(train))))
     if n_eval is not None:
         eval_ = eval_.select(range(min(n_eval, len(eval_))))
     
-    # Map: each example becomes (chosen_ids, chosen_mask, rejected_ids, rejected_mask)
-    train = train.map(
-        lambda x: format_pair(x, tokenizer, max_length),
-        remove_columns=train.column_names,
-        desc="Tokenizing train",
-    )
+    if skip_train:
+        # Return an empty Dataset for the train slot; do not tokenize.
+        train = train.select(range(0))
+    else:
+        train = train.map(
+            lambda x: format_pair(x, tokenizer, max_length),
+            remove_columns=train.column_names,
+            desc="Tokenizing train",
+        )
+    
     eval_ = eval_.map(
         lambda x: format_pair(x, tokenizer, max_length),
         remove_columns=eval_.column_names,
