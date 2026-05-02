@@ -76,7 +76,6 @@ def main():
     print(f"Reward (left-padded with 50 pad tokens): {r3:.6f}")
     
     # Compare the pooled hidden states directly, not just the rewards
-    import torch
     model.eval()
 
     with torch.no_grad():
