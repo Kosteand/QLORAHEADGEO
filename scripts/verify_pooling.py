@@ -75,6 +75,21 @@ def main():
         r3 = out3.logits.float().item()
     print(f"Reward (left-padded with 50 pad tokens): {r3:.6f}")
     
+    # Compare the pooled hidden states directly, not just the rewards
+    import torch
+    model.eval()
+
+    with torch.no_grad():
+        out1 = model.model.model(input_ids=enc.input_ids, attention_mask=enc.attention_mask, return_dict=True)
+        out2 = model.model.model(input_ids=ids_padded, attention_mask=mask_padded, return_dict=True)
+
+    from src.model import last_token_pool
+    h1 = last_token_pool(out1.last_hidden_state, enc.attention_mask)
+    h2 = last_token_pool(out2.last_hidden_state, mask_padded)
+
+    print("h1 shape:", h1.shape, "h2 shape:", h2.shape)
+    print("max abs diff in pooled hidden states:", (h1.float() - h2.float()).abs().max().item())
+    print("relative diff:", ((h1.float() - h2.float()).norm() / h1.float().norm()).item())
     # Check
     tol = 1e-2  # bf16 has limited precision; this is a reasonable tolerance
     assert abs(r1 - r2) < tol, (
