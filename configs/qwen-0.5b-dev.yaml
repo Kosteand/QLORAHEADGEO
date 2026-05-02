@@ -1,0 +1,47 @@
+# Development config for Qwen2.5-0.5B-Instruct.
+# To compare linear vs concave heads, run with:
+#   --activation_name ident          (linear baseline)
+#   --activation_name bounded_above  (recommended concave head)
+#   --activation_name gelu_bounded_above  (alternative concave)
+#   --activation_name bounded        (one-sided concavity, NOT globally concave)
+
+base_model_name: "Qwen/Qwen2.5-0.5B-Instruct"
+activation_name: "bounded_above"
+head_init_scale: 0.02
+head_init_bias: 0.0
+
+# LoRA
+lora_r: 8
+lora_alpha: 8
+lora_dropout: 0.05
+lora_target_modules:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+  - gate_proj
+  - up_proj
+  - down_proj
+
+# Data
+max_length: 1024
+n_train: null   # null = full UltraFeedback; set to 1000 for overfit test
+n_eval: 200
+
+# Training
+output_dir: "./outputs/rm-qwen-0.5b-bounded_above"
+per_device_train_batch_size: 4
+per_device_eval_batch_size: 8
+gradient_accumulation_steps: 4   # effective batch 16
+num_train_epochs: 1
+learning_rate: 2.0e-4
+lr_scheduler_type: cosine
+warmup_ratio: 0.03
+bf16: true
+logging_steps: 5
+eval_steps: 25
+save_strategy: epoch
+seed: 42
+
+run_name: "rm-qwen-0.5b-bounded_above"
+report_to: "none"  # change to wandb for real runs
