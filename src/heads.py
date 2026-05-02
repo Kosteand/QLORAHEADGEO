@@ -49,7 +49,7 @@ class BoundedAbove(nn.Module):
     """
     def __init__(self):
         super().__init__()
-        self.a = nn.Parameter(torch.rand(1))
+        self.a = nn.Parameter(torch.tensor([-3.0]))
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return F.softplus(self.a) * F.logsigmoid(x)

@@ -20,12 +20,14 @@ import os
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 import yaml
 from peft import LoraConfig, TaskType, get_peft_model
 from transformers import AutoTokenizer
 from trl import RewardConfig, RewardTrainer
 
 from .data import load_ultrafeedback
+from .heads import BoundedAbove
 from .model import RewardModel, RewardModelConfig
 
 
@@ -68,9 +70,39 @@ class TrainConfig:
     save_strategy: str = "epoch"
     seed: int = 42
     
+    # Regularization
+    alpha_reg: float = 0.0  # L2 penalty on BoundedAbove's alpha; 0 = disabled
+
     # Misc
     run_name: str = "rm-dev"
     report_to: str = "none"  # set to "wandb" for real runs
+
+
+class ConcaveRewardTrainer(RewardTrainer):
+    """RewardTrainer + optional L2 penalty on BoundedAbove's alpha.
+
+    Adds cfg.alpha_reg * alpha^2 to the ranking loss at every step.
+    When alpha_reg=0 (default) this is identical to RewardTrainer.
+    Only fires when a BoundedAbove module is present; other activations
+    (ident, bounded, gelu_bounded_above) are unaffected.
+    """
+
+    def __init__(self, *args, alpha_reg: float = 0.0, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.alpha_reg = alpha_reg
+
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        out = super().compute_loss(model, inputs, return_outputs=True, **kwargs)
+        loss, outputs = out if isinstance(out, tuple) else (out, {})
+
+        if self.alpha_reg > 0.0:
+            for module in model.modules():
+                if isinstance(module, BoundedAbove):
+                    alpha = F.softplus(module.a)
+                    loss = loss + self.alpha_reg * (alpha ** 2).sum()
+                    break
+
+        return (loss, outputs) if return_outputs else loss
 
 
 def load_config(path: str) -> TrainConfig:
@@ -199,7 +231,8 @@ def main():
         seed=cfg.seed,
     )
     
-    trainer = RewardTrainer(
+    trainer = ConcaveRewardTrainer(
+        alpha_reg=cfg.alpha_reg,
         model=model,
         args=training_args,
         processing_class=tokenizer,

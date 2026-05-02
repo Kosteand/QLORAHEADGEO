@@ -9,6 +9,7 @@ base_model_name: "Qwen/Qwen2.5-0.5B-Instruct"
 activation_name: "bounded_above"
 head_init_scale: 0.02
 head_init_bias: 0.0
+alpha_reg: 0.0   # L2 penalty on BoundedAbove alpha; try 0.01–0.1
 
 # LoRA
 lora_r: 8

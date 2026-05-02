@@ -305,7 +305,7 @@ def main():
     
     print()
     print("Running runaway diagnostic...")
-    runaway = runaway_diagnostic(model, tokenizer, eval_ds)
+    runaway = runaway_diagnostic(model, tokenizer, eval_ds, t_range=(-50.0, 500.0), n_steps=100)
     summary = runaway_summary(runaway)
     print("Runaway summary:")
     print(json.dumps(summary, indent=2))
