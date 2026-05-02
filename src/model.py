@@ -133,8 +133,12 @@ class RewardModel(PreTrainedModel):
         pooled = last_token_pool(hidden_states, attention_mask)
         
         if return_preactivation:
-            z = self.reward_head.preactivation(pooled)  # (batch, head_width)
-            r = self.reward_head(pooled)                 # (batch, 1)
+            head = self.reward_head
+            if hasattr(head, "modules_to_save"):
+                head = head.modules_to_save["default"]
+            z = head.preactivation(pooled)              # (batch, head_width)
+            r = self.reward_head(pooled)                # (batch, 1) -- wrapper handles __call__ fine
+            
             return SequenceClassifierOutputWithPast(
                 loss=None,
                 logits=r,

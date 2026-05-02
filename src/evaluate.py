@@ -38,8 +38,38 @@ from .model import RewardModel, RewardModelConfig
 
 
 def load_trained_rm(checkpoint_dir: str, base_model_name: str, activation_name: str):
-    """Reconstruct the trained RewardModel from a saved LoRA checkpoint."""
-    config = RewardModelConfig(base_model_name=base_model_name, activation_name=activation_name)
+    """Reconstruct the trained RewardModel from a saved LoRA checkpoint.
+    
+    If a saved rm_train_config.json is present in the checkpoint dir,
+    we use it to reconstruct the head with the exact architecture used
+    at training time (head_width, intermediate_size, etc.). Without this,
+    we fall back to RewardModelConfig defaults which may not match.
+    """
+    # Try to load saved training config so we get head_width etc. right.
+    config_path = Path(checkpoint_dir) / "rm_train_config.json"
+    if config_path.exists():
+        with open(config_path) as f:
+            saved = json.load(f)
+        print(f"Loaded saved training config from {config_path}")
+        config = RewardModelConfig(
+            base_model_name=saved.get("base_model_name", base_model_name),
+            activation_name=saved.get("activation_name", activation_name),
+            head_init_scale=saved.get("head_init_scale", 0.02),
+            head_init_bias=saved.get("head_init_bias", 0.0),
+            head_width=saved.get("head_width", 32),
+            head_intermediate_size=saved.get("head_intermediate_size", None),
+        )
+    else:
+        print(
+            f"WARNING: no rm_train_config.json found at {config_path}. "
+            f"Using RewardModelConfig defaults; this may cause shape "
+            f"mismatches if the saved checkpoint used non-default values."
+        )
+        config = RewardModelConfig(
+            base_model_name=base_model_name,
+            activation_name=activation_name,
+        )
+    
     base_rm = RewardModel.from_base_model(config, torch_dtype=torch.bfloat16)
     base_rm.config.pad_token_id = AutoTokenizer.from_pretrained(base_model_name).pad_token_id
     
@@ -262,7 +292,11 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
     
     print(f"Loading eval data ({args.n_eval} examples)...")
-    _, eval_ds = load_ultrafeedback(tokenizer, max_length=1024, n_train=10, n_eval=args.n_eval)
+    # n_train=0 since evaluate.py doesn't use the train split.
+    # We pass None to skip train-split tokenization entirely.
+    _, eval_ds = load_ultrafeedback(
+        tokenizer, max_length=1024, n_train=0, n_eval=args.n_eval
+    )
     
     print()
     print("Running standard evaluation...")
