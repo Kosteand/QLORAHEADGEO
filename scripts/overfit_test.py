@@ -34,6 +34,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src.data import load_ultrafeedback, inspect_example
 from src.model import RewardModel, RewardModelConfig
 
+tok = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
+if tok.pad_token is None:
+    tok.pad_token = tok.eos_token
+
+train_ds, _ = load_ultrafeedback(tok, max_length=1024, n_train=2)
+ex = train_ds[0]
+print("CHOSEN:", tok.decode(ex["input_ids_chosen"])[-300:])
+print()
+print("REJECTED:", tok.decode(ex["input_ids_rejected"])[-300:])
 
 OVERFIT_THRESHOLD = 0.90  # require 90%+ training accuracy by end
 
