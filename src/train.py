@@ -202,7 +202,7 @@ def main():
     trainer = RewardTrainer(
         model=model,
         args=training_args,
-        tokenizer=tokenizer,
+        processing_class=tokenizer,
         train_dataset=train_ds,
         eval_dataset=eval_ds,
     )

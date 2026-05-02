@@ -136,9 +136,9 @@ def main():
     trainer = RewardTrainer(
         model=model,
         args=args,
-        tokenizer=tokenizer,
+        processing_class=tokenizer,
         train_dataset=train_ds,
-        eval_dataset=None,
+        eval_dataset=train_ds.select(range(min(50, len(train_ds)))),  # tiny placeholder
     )
     
     print()
