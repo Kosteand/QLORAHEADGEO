@@ -1,12 +1,16 @@
 """
-Train a reward model with LoRA on Qwen2.5-0.5B-Instruct (or any base model).
+Train a reward model with LoRA.
 
 Supports two data sources via `dataset_source`:
-- "ultrafeedback": real human labels from UltraFeedback Binarized.
-- "gold_labeled": a dataset relabeled by a strong RM (Path B / Gao et al.).
+- "ultrafeedback": real human labels.
+- "gold_labeled": dataset relabeled by a strong RM.
 
-Usage:
-    python -m src.train --config configs/qwen-0.5b-dev.yaml
+Regularizers:
+- alpha_reg: L2 on BoundedAbove's alpha parameter (legacy).
+- head_reg_weight: weight on activation-specific .regularization_loss() methods.
+  Supports the PhD's general pattern: any submodule that exposes a
+  regularization_loss() method gets summed and weighted. Currently used
+  by GaussianActivation to penalize peak amplitude.
 """
 
 from __future__ import annotations
@@ -48,8 +52,8 @@ class TrainConfig:
     ])
 
     # Data source
-    dataset_source: str = "ultrafeedback"   # or "gold_labeled"
-    gold_labeled_path: str = "./gold_labeled"   # only used if dataset_source == "gold_labeled"
+    dataset_source: str = "ultrafeedback"
+    gold_labeled_path: str = "./gold_labeled"
     max_length: int = 1024
     n_train: int | None = None
     n_eval: int = 200
@@ -70,33 +74,72 @@ class TrainConfig:
     seed: int = 42
 
     # Regularization
-    alpha_reg: float = 0.0
+    alpha_reg: float = 0.0       # L2 on BoundedAbove's alpha (specific to that activation)
+    head_reg_weight: float = 0.0 # weight on submodule .regularization_loss() methods
+                                 # used by GaussianActivation (peak amplitude penalty)
+                                 # PhD's RL code uses 1e-3 by default.
 
     # Misc
     run_name: str = "rm-dev"
     report_to: str = "none"
 
 
-class ConcaveRewardTrainer(RewardTrainer):
-    """RewardTrainer + optional L2 penalty on BoundedAbove's alpha.
+def _module_regularization_loss(model) -> torch.Tensor:
+    """Sum .regularization_loss() over all submodules that expose it.
+    
+    Walks the model (typically PEFT-wrapped), finds any submodule with a
+    callable `regularization_loss` attribute, and sums their outputs.
+    Returns a scalar tensor (zero if no such submodules).
+    
+    This is the PhD's general pattern from worldModels3.py. Lets activations
+    self-declare any auxiliary regularizers they want applied.
+    """
+    first_param = next(model.parameters())
+    total = torch.tensor(0.0, device=first_param.device, dtype=first_param.dtype)
+    for submodule in model.modules():
+        rfn = getattr(submodule, "regularization_loss", None)
+        if rfn is not None and callable(rfn):
+            total = total + rfn()
+    return total
 
-    When alpha_reg=0 (default) this is identical to RewardTrainer.
+
+class ConcaveRewardTrainer(RewardTrainer):
+    """RewardTrainer + optional regularizers on the reward head.
+
+    Two regularization knobs:
+    - alpha_reg: L2 penalty specifically on BoundedAbove's alpha = softplus(a).
+    - head_reg_weight: weight on the sum of all submodule
+      regularization_loss() methods. Currently used by GaussianActivation
+      to bound peak amplitude.
     """
 
-    def __init__(self, *args, alpha_reg: float = 0.0, **kwargs):
+    def __init__(
+        self,
+        *args,
+        alpha_reg: float = 0.0,
+        head_reg_weight: float = 0.0,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         self.alpha_reg = alpha_reg
+        self.head_reg_weight = head_reg_weight
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         out = super().compute_loss(model, inputs, return_outputs=True, **kwargs)
         loss, outputs = out if isinstance(out, tuple) else (out, {})
 
+        # alpha_reg: legacy, specific to BoundedAbove
         if self.alpha_reg > 0.0:
             for module in model.modules():
                 if isinstance(module, BoundedAbove):
                     alpha = F.softplus(module.a)
                     loss = loss + self.alpha_reg * (alpha ** 2).sum()
                     break
+
+        # head_reg_weight: general submodule regularization
+        if self.head_reg_weight > 0.0:
+            reg = _module_regularization_loss(model)
+            loss = loss + self.head_reg_weight * reg
 
         return (loss, outputs) if return_outputs else loss
 
@@ -156,7 +199,6 @@ def build_model_and_tokenizer(cfg: TrainConfig):
 
 
 def load_data(cfg: TrainConfig, tokenizer):
-    """Route to the correct dataset loader based on cfg.dataset_source."""
     if cfg.dataset_source == "ultrafeedback":
         print(f"Loading UltraFeedback (n_train={cfg.n_train}, n_eval={cfg.n_eval})...")
         return load_ultrafeedback(
@@ -190,15 +232,13 @@ def main():
     parser.add_argument("--output_dir", default=None)
     parser.add_argument("--run_name", default=None)
     parser.add_argument("--alpha_reg", type=float, default=None)
+    parser.add_argument("--head_reg_weight", type=float, default=None)
     parser.add_argument("--dataset_source", default=None,
                         choices=[None, "ultrafeedback", "gold_labeled"])
     parser.add_argument("--gold_labeled_path", default=None)
     args = parser.parse_args()
 
     cfg = load_config(args.config)
-    
-    if args.alpha_reg is not None:
-        cfg.alpha_reg = args.alpha_reg
 
     if args.activation_name is not None:
         cfg.activation_name = args.activation_name
@@ -210,6 +250,8 @@ def main():
         cfg.run_name = args.run_name
     if args.alpha_reg is not None:
         cfg.alpha_reg = args.alpha_reg
+    if args.head_reg_weight is not None:
+        cfg.head_reg_weight = args.head_reg_weight
     if args.dataset_source is not None:
         cfg.dataset_source = args.dataset_source
     if args.gold_labeled_path is not None:
@@ -250,6 +292,7 @@ def main():
 
     trainer = ConcaveRewardTrainer(
         alpha_reg=cfg.alpha_reg,
+        head_reg_weight=cfg.head_reg_weight,
         model=model,
         args=training_args,
         processing_class=tokenizer,

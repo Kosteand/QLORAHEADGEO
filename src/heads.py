@@ -2,24 +2,30 @@
 Reward heads of the form:
     r(h) = mean_k(phi(fc2(leaky_relu(fc1(h))))) + b_out
 
-fc1: Linear(hidden_size → intermediate_size)
-LeakyReLU (non-linearity between layers)
-fc2: Linear(intermediate_size → head_width)
-phi: element-wise concave activation applied to each of the head_width units
-mean: average over the head_width dimension → scalar per example
-b_out: learned scalar bias
-
 Activations included:
-    Ident          : phi(z) = z. Linear baseline (weakly concave).
+    Ident          : phi(z) = z. Linear baseline.
     BoundedAbove   : phi(z) = alpha * log_sigmoid(z). Strictly concave,
-                     bounded above by 0, monotonic. The recommended
-                     concave variant.
+                     bounded above by 0, monotonic. Has a "ceiling" at infinity.
+    Gaussian       : phi(z) = b * exp(-a*z^2). Strictly concave, peaked at z=0,
+                     decays in BOTH directions. Has no monotonic direction --
+                     no direction in which the policy can extract more reward.
     GeluBoundedAbove: phi(z) = -alpha * GELU(z). Concave, bounded above
                       by 0. Non-monotonic for z > 0.
     Bounded        : phi(z) = alpha * tanh(z). Monotonic, bounded in
                      (-alpha, +alpha), but only one-sided concavity.
 
+Important geometric distinction:
+    - bounded_above is monotonic: there's a "high z = high reward" direction
+      with a ceiling. Policy can push z high; ceiling caps reward magnitude
+      but doesn't prevent gaming (any large-z response hits the ceiling).
+    - gaussian is peaked: maximum at z=0, decays in both directions.
+      Policy that pushes z away from 0 LOSES reward. There is no direction
+      to runaway. This is the stronger structural fix.
+
 All learned positive parameters are softplus(theta) for raw learnable theta.
+
+Activations may optionally implement a `regularization_loss()` method that
+returns a scalar tensor. The trainer collects and weights these.
 """
 
 from __future__ import annotations
@@ -45,7 +51,6 @@ class BoundedAbove(nn.Module):
     
     Strictly concave, monotonic increasing, bounded above by 0.
     Linear-asymptotic as z -> -inf: phi(z) ~ alpha * z.
-    Recommended primary concave head.
     """
     def __init__(self):
         super().__init__()
@@ -59,18 +64,39 @@ class BoundedAbove(nn.Module):
         return F.softplus(self.a)
 
 
-class GeluBoundedAbove(nn.Module):
-    """phi(z) = -alpha * GELU(z), alpha = softplus(a) > 0.
+class GaussianActivation(nn.Module):
+    """phi(z) = b * exp(-a*z^2), a, b = softplus(.) > 0.
     
-    NOT globally concave: GELU has a small non-convex region near
-    z ~ -0.75, so -GELU has a corresponding non-concave region. Concave
-    on most of R but not all.
+    Strictly concave, single peak at z=0, decays exponentially in BOTH
+    directions. Unlike bounded_above, there is no monotonic direction --
+    every direction away from z=0 loses reward. This is the stronger
+    structural fix for runaway: the policy cannot extract more reward
+    by pushing z further in any direction.
     
-    Bounded above by 0 (achieved at z = 0). NOT monotonic: phi decreases
-    as z grows past 0.
+    Provides regularization_loss() = mean(softplus(b)^2), which caps the
+    Gaussian peak amplitude. Without it, the optimizer can scale up b
+    to make differences larger, partially defeating the bound.
     
-    Useful as a comparison head; see Bounded for one-sided concavity case.
+    NOT monotonic in z. The "high z = high reward" interpretation is gone:
+    "small |z| = high reward" replaces it. Diagnostics should plot |z|.
     """
+    def __init__(self):
+        super().__init__()
+        self.a = nn.Parameter(torch.rand(1))
+        self.b = nn.Parameter(torch.rand(1))
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.softplus(self.b) * torch.exp(
+            -F.softplus(self.a) * x.square()
+        )
+    
+    def regularization_loss(self) -> torch.Tensor:
+        """L2 on the peak amplitude b. Following the PhD's RL setup."""
+        return F.softplus(self.b).square().mean()
+
+
+class GeluBoundedAbove(nn.Module):
+    """phi(z) = -alpha * GELU(z). Bounded above, NOT globally concave."""
     def __init__(self):
         super().__init__()
         self.a = nn.Parameter(torch.rand(1))
@@ -80,12 +106,7 @@ class GeluBoundedAbove(nn.Module):
 
 
 class Bounded(nn.Module):
-    """phi(z) = alpha * tanh(z), alpha = softplus(a) > 0.
-    
-    Monotonic increasing, bounded in (-alpha, +alpha).
-    NOT globally concave: concave on z >= 0, convex on z < 0.
-    Tests whether one-sided saturation suffices for runaway suppression.
-    """
+    """phi(z) = alpha * tanh(z). Monotonic, bounded, one-sided concave."""
     def __init__(self):
         super().__init__()
         self.a = nn.Parameter(torch.rand(1))
@@ -99,50 +120,51 @@ class Bounded(nn.Module):
 ACTIVATION_REGISTRY: dict[str, type] = {
     "ident": Ident,
     "bounded_above": BoundedAbove,
+    "gaussian": GaussianActivation,
     "gelu_bounded_above": GeluBoundedAbove,
     "bounded": Bounded,
 }
 
-# Globally concave in z (and therefore in h, since z is affine in h)
+# Globally concave in z
 GLOBALLY_CONCAVE: dict[str, bool] = {
     "ident": True,                 # weakly (affine)
     "bounded_above": True,
-    "gelu_bounded_above": False,   # GELU has a small non-convex region near z=-0.75
-    "bounded": False,              # one-sided
-}
-
-# Strictly concave (excludes ident)
-STRICTLY_CONCAVE: dict[str, bool] = {
-    "ident": False,
-    "bounded_above": True,
+    "gaussian": True,              # strictly concave (negative def. Hessian)
     "gelu_bounded_above": False,
     "bounded": False,
 }
 
-# Monotonically increasing (preserves BT pairwise rankings)
+STRICTLY_CONCAVE: dict[str, bool] = {
+    "ident": False,
+    "bounded_above": True,
+    "gaussian": True,
+    "gelu_bounded_above": False,
+    "bounded": False,
+}
+
+# Monotonically increasing
 MONOTONIC: dict[str, bool] = {
     "ident": True,
     "bounded_above": True,
-    "gelu_bounded_above": False,    # decreasing for z > 0
+    "gaussian": False,             # peaked at 0; decreasing for z > 0
+    "gelu_bounded_above": False,
     "bounded": True,
+}
+
+# Has interior peak (vs monotonic-with-asymptote)
+PEAKED: dict[str, bool] = {
+    "ident": False,
+    "bounded_above": False,
+    "gaussian": True,
+    "gelu_bounded_above": True,    # peaks at z=0, decreases for z > 0
+    "bounded": False,
 }
 
 
 # ---------- The head module ----------
 
 class RewardHead(nn.Module):
-    """Reward head: Linear → LeakyReLU → Linear → ConcaveActivation → mean → +bias.
-
-    r(h) = mean_k(phi(fc2(leaky_relu(fc1(h))))) + b_out
-
-    Args:
-        hidden_size: dimension of input hidden state h.
-        activation_name: key into ACTIVATION_REGISTRY.
-        intermediate_size: width of the hidden layer; defaults to hidden_size.
-        head_width: number of parallel output units before mean pooling (k).
-        init_scale: stddev of Gaussian init for fc1/fc2 weights.
-        init_bias: initial value of output bias b_out.
-    """
+    """Reward head: Linear → LeakyReLU → Linear → ConcaveActivation → mean → +bias."""
 
     def __init__(
         self,
@@ -175,15 +197,12 @@ class RewardHead(nn.Module):
         nn.init.zeros_(self.fc2.bias)
 
     def preactivation(self, h: torch.Tensor) -> torch.Tensor:
-        """z = fc2(leaky_relu(fc1(h))). Shape: (batch, head_width)."""
         return self.fc2(F.leaky_relu(self.fc1(h)))
 
     def forward(self, h: torch.Tensor) -> torch.Tensor:
-        """r = mean_k(phi(z)) + b_out. Shape: (batch, 1)."""
-        z = self.preactivation(h)                      # (batch, head_width)
-        r = self.activation(z)                         # (batch, head_width)
-        return r.mean(dim=-1, keepdim=True) + self.output_bias  # (batch, 1)
+        z = self.preactivation(h)
+        r = self.activation(z)
+        return r.mean(dim=-1, keepdim=True) + self.output_bias
 
     def num_extra_params(self) -> int:
-        """Parameter count of the activation beyond fc1/fc2/output_bias."""
         return sum(p.numel() for p in self.activation.parameters())
