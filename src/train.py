@@ -193,10 +193,10 @@ def main():
     parser.add_argument("--dataset_source", default=None,
                         choices=[None, "ultrafeedback", "gold_labeled"])
     parser.add_argument("--gold_labeled_path", default=None)
+    args = parser.parse_args()
 
     if args.alpha_reg is not None:
         cfg.alpha_reg = args.alpha_reg
-    args = parser.parse_args()
 
     cfg = load_config(args.config)
     if args.activation_name is not None:
