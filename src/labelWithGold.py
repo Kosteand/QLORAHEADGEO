@@ -47,8 +47,14 @@ def load_gold_model(dtype: str = "bf16"):
     print(f"Loading gold model: {GOLD_MODEL_NAME} (dtype={dtype})...")
     
     tokenizer = AutoTokenizer.from_pretrained(GOLD_MODEL_NAME)
+    if tokenizer.chat_template is None:
+        print("  Skywork tokenizer has no chat_template; loading from Llama-3.1-8B-Instruct.")
+        from transformers import AutoTokenizer as AT
+        llama_tok = AT.from_pretrained("meta-llama/Llama-3.1-8B-Instruct")
+        tokenizer.chat_template = llama_tok.chat_template
     
     kwargs = {"num_labels": 1, "device_map": "cuda"}
+    # ... rest unchanged
     if dtype == "bf16":
         kwargs["torch_dtype"] = torch.bfloat16
     elif dtype == "int4":
