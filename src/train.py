@@ -195,10 +195,11 @@ def main():
     parser.add_argument("--gold_labeled_path", default=None)
     args = parser.parse_args()
 
+    cfg = load_config(args.config)
+    
     if args.alpha_reg is not None:
         cfg.alpha_reg = args.alpha_reg
 
-    cfg = load_config(args.config)
     if args.activation_name is not None:
         cfg.activation_name = args.activation_name
     if args.n_train is not None:
