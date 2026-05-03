@@ -1,16 +1,15 @@
 """
 Train a reward model with LoRA.
 
-Supports two data sources via `dataset_source`:
-- "ultrafeedback": real human labels.
-- "gold_labeled": dataset relabeled by a strong RM.
-
 Regularizers:
-- alpha_reg: L2 on BoundedAbove's alpha parameter (legacy).
+- alpha_reg: L2 on BoundedAbove's alpha (legacy, only fires if BoundedAbove is present).
 - head_reg_weight: weight on activation-specific .regularization_loss() methods.
-  Supports the PhD's general pattern: any submodule that exposes a
-  regularization_loss() method gets summed and weighted. Currently used
-  by GaussianActivation to penalize peak amplitude.
+                   Currently used by GaussianActivation to penalize peak amplitude.
+- preact_reg: L2 penalty on |z|, the post-fc2 input to the activation.
+              Forces the MLP to keep preactivations small (near peak for
+              peaked activations; near origin for monotonic ones).
+              Combined with concave activations, this ensures the activation
+              operates on the data, not just at far-field probes.
 """
 
 from __future__ import annotations
@@ -28,7 +27,7 @@ from transformers import AutoTokenizer
 from trl import RewardConfig, RewardTrainer
 
 from .data import load_ultrafeedback, load_gold_labeled
-from .heads import BoundedAbove
+from .heads import BoundedAbove, RewardHead
 from .model import RewardModel, RewardModelConfig
 
 
@@ -51,7 +50,7 @@ class TrainConfig:
         "gate_proj", "up_proj", "down_proj",
     ])
 
-    # Data source
+    # Data
     dataset_source: str = "ultrafeedback"
     gold_labeled_path: str = "./gold_labeled"
     max_length: int = 1024
@@ -74,26 +73,16 @@ class TrainConfig:
     seed: int = 42
 
     # Regularization
-    alpha_reg: float = 0.0       # L2 on BoundedAbove's alpha (specific to that activation)
-    head_reg_weight: float = 0.0 # weight on submodule .regularization_loss() methods
-                                 # used by GaussianActivation (peak amplitude penalty)
-                                 # PhD's RL code uses 1e-3 by default.
+    alpha_reg: float = 0.0          # legacy: L2 on BoundedAbove.alpha
+    head_reg_weight: float = 0.0    # weight on submodule .regularization_loss()
+    preact_reg: float = 0.0         # L2 on preactivation magnitude (post-fc2)
 
-    # Misc
     run_name: str = "rm-dev"
     report_to: str = "none"
 
 
-def _module_regularization_loss(model) -> torch.Tensor:
-    """Sum .regularization_loss() over all submodules that expose it.
-    
-    Walks the model (typically PEFT-wrapped), finds any submodule with a
-    callable `regularization_loss` attribute, and sums their outputs.
-    Returns a scalar tensor (zero if no such submodules).
-    
-    This is the PhD's general pattern from worldModels3.py. Lets activations
-    self-declare any auxiliary regularizers they want applied.
-    """
+def _module_regularization_loss(model):
+    """Sum .regularization_loss() over submodules that expose it."""
     first_param = next(model.parameters())
     total = torch.tensor(0.0, device=first_param.device, dtype=first_param.dtype)
     for submodule in model.modules():
@@ -104,31 +93,25 @@ def _module_regularization_loss(model) -> torch.Tensor:
 
 
 class ConcaveRewardTrainer(RewardTrainer):
-    """RewardTrainer + optional regularizers on the reward head.
-
-    Two regularization knobs:
-    - alpha_reg: L2 penalty specifically on BoundedAbove's alpha = softplus(a).
-    - head_reg_weight: weight on the sum of all submodule
-      regularization_loss() methods. Currently used by GaussianActivation
-      to bound peak amplitude.
-    """
+    """RewardTrainer with optional regularizers on the reward head."""
 
     def __init__(
         self,
         *args,
         alpha_reg: float = 0.0,
         head_reg_weight: float = 0.0,
+        preact_reg: float = 0.0,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self.alpha_reg = alpha_reg
         self.head_reg_weight = head_reg_weight
+        self.preact_reg = preact_reg
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         out = super().compute_loss(model, inputs, return_outputs=True, **kwargs)
         loss, outputs = out if isinstance(out, tuple) else (out, {})
 
-        # alpha_reg: legacy, specific to BoundedAbove
         if self.alpha_reg > 0.0:
             for module in model.modules():
                 if isinstance(module, BoundedAbove):
@@ -136,21 +119,40 @@ class ConcaveRewardTrainer(RewardTrainer):
                     loss = loss + self.alpha_reg * (alpha ** 2).sum()
                     break
 
-        # head_reg_weight: general submodule regularization
         if self.head_reg_weight > 0.0:
             reg = _module_regularization_loss(model)
             loss = loss + self.head_reg_weight * reg
 
+        if self.preact_reg > 0.0:
+            # Forward the chosen and rejected through the model with
+            # return_preactivation=True. This is a second forward pass
+            # but it's the cleanest way to expose preactivations.
+            z_chosen = model(
+                input_ids=inputs["input_ids_chosen"],
+                attention_mask=inputs["attention_mask_chosen"],
+                return_preactivation=True,
+            ).hidden_states  # (batch, head_width)
+            z_rejected = model(
+                input_ids=inputs["input_ids_rejected"],
+                attention_mask=inputs["attention_mask_rejected"],
+                return_preactivation=True,
+            ).hidden_states
+            # Penalize squared L2 norm of preactivation, averaged over
+            # batch and head_width.
+            preact_penalty = (z_chosen.float().pow(2).mean()
+                              + z_rejected.float().pow(2).mean()) * 0.5
+            loss = loss + self.preact_reg * preact_penalty
+
         return (loss, outputs) if return_outputs else loss
 
 
-def load_config(path: str) -> TrainConfig:
+def load_config(path):
     with open(path) as f:
         data = yaml.safe_load(f)
     return TrainConfig(**data)
 
 
-def build_model_and_tokenizer(cfg: TrainConfig):
+def build_model_and_tokenizer(cfg):
     print(f"Loading tokenizer for {cfg.base_model_name}...")
     tokenizer = AutoTokenizer.from_pretrained(cfg.base_model_name)
     if tokenizer.pad_token is None:
@@ -182,25 +184,20 @@ def build_model_and_tokenizer(cfg: TrainConfig):
         bias="none",
     )
     model = get_peft_model(model, lora_config)
-
     model.print_trainable_parameters()
     head_trainable = any(
         "reward_head" in name and p.requires_grad
         for name, p in model.named_parameters()
     )
     if not head_trainable:
-        raise RuntimeError(
-            "reward_head is NOT trainable! Check modules_to_save in LoRA config."
-        )
+        raise RuntimeError("reward_head is NOT trainable!")
     print("[OK] reward_head parameters are trainable")
     model.enable_input_require_grads()
-
     return model, tokenizer
 
 
-def load_data(cfg: TrainConfig, tokenizer):
+def load_data(cfg, tokenizer):
     if cfg.dataset_source == "ultrafeedback":
-        print(f"Loading UltraFeedback (n_train={cfg.n_train}, n_eval={cfg.n_eval})...")
         return load_ultrafeedback(
             tokenizer,
             max_length=cfg.max_length,
@@ -208,8 +205,6 @@ def load_data(cfg: TrainConfig, tokenizer):
             n_eval=cfg.n_eval,
         )
     elif cfg.dataset_source == "gold_labeled":
-        print(f"Loading gold-labeled dataset from {cfg.gold_labeled_path} "
-              f"(n_train={cfg.n_train}, n_eval={cfg.n_eval})...")
         return load_gold_labeled(
             tokenizer,
             dataset_path=cfg.gold_labeled_path,
@@ -218,10 +213,7 @@ def load_data(cfg: TrainConfig, tokenizer):
             n_eval=cfg.n_eval,
         )
     else:
-        raise ValueError(
-            f"Unknown dataset_source: {cfg.dataset_source!r}. "
-            f"Use 'ultrafeedback' or 'gold_labeled'."
-        )
+        raise ValueError(f"Unknown dataset_source: {cfg.dataset_source!r}")
 
 
 def main():
@@ -229,10 +221,12 @@ def main():
     parser.add_argument("--config", required=True)
     parser.add_argument("--activation_name", default=None)
     parser.add_argument("--n_train", type=int, default=None)
+    parser.add_argument("--num_train_epochs", type=float, default=None)
     parser.add_argument("--output_dir", default=None)
     parser.add_argument("--run_name", default=None)
     parser.add_argument("--alpha_reg", type=float, default=None)
     parser.add_argument("--head_reg_weight", type=float, default=None)
+    parser.add_argument("--preact_reg", type=float, default=None)
     parser.add_argument("--dataset_source", default=None,
                         choices=[None, "ultrafeedback", "gold_labeled"])
     parser.add_argument("--gold_labeled_path", default=None)
@@ -240,22 +234,16 @@ def main():
 
     cfg = load_config(args.config)
 
-    if args.activation_name is not None:
-        cfg.activation_name = args.activation_name
-    if args.n_train is not None:
-        cfg.n_train = args.n_train
-    if args.output_dir is not None:
-        cfg.output_dir = args.output_dir
-    if args.run_name is not None:
-        cfg.run_name = args.run_name
-    if args.alpha_reg is not None:
-        cfg.alpha_reg = args.alpha_reg
-    if args.head_reg_weight is not None:
-        cfg.head_reg_weight = args.head_reg_weight
-    if args.dataset_source is not None:
-        cfg.dataset_source = args.dataset_source
-    if args.gold_labeled_path is not None:
-        cfg.gold_labeled_path = args.gold_labeled_path
+    if args.activation_name is not None: cfg.activation_name = args.activation_name
+    if args.n_train is not None: cfg.n_train = args.n_train
+    if args.num_train_epochs is not None: cfg.num_train_epochs = args.num_train_epochs
+    if args.output_dir is not None: cfg.output_dir = args.output_dir
+    if args.run_name is not None: cfg.run_name = args.run_name
+    if args.alpha_reg is not None: cfg.alpha_reg = args.alpha_reg
+    if args.head_reg_weight is not None: cfg.head_reg_weight = args.head_reg_weight
+    if args.preact_reg is not None: cfg.preact_reg = args.preact_reg
+    if args.dataset_source is not None: cfg.dataset_source = args.dataset_source
+    if args.gold_labeled_path is not None: cfg.gold_labeled_path = args.gold_labeled_path
 
     print("=" * 60)
     print("Training config:")
@@ -264,8 +252,6 @@ def main():
     print("=" * 60)
 
     model, tokenizer = build_model_and_tokenizer(cfg)
-
-    print()
     train_ds, eval_ds = load_data(cfg, tokenizer)
     print(f"Train: {len(train_ds)} examples, Eval: {len(eval_ds)} examples")
 
@@ -293,6 +279,7 @@ def main():
     trainer = ConcaveRewardTrainer(
         alpha_reg=cfg.alpha_reg,
         head_reg_weight=cfg.head_reg_weight,
+        preact_reg=cfg.preact_reg,
         model=model,
         args=training_args,
         processing_class=tokenizer,
@@ -300,12 +287,10 @@ def main():
         eval_dataset=eval_ds,
     )
 
-    print()
     print("Starting training...")
     trainer.train()
 
-    print()
-    print("Training done. Saving final model...")
+    print("Saving final model...")
     final_dir = os.path.join(cfg.output_dir, "final")
     trainer.save_model(final_dir)
 
