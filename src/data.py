@@ -1,20 +1,17 @@
 """
 Data preparation for preference-based reward modeling.
 
-Critical details:
-- We use tokenizer.apply_chat_template to format prompt+response correctly.
-  Skipping this gives out-of-distribution input to the model and reward
-  signal collapses.
-- We tokenize chosen and rejected SEPARATELY, producing two (input_ids,
-  attention_mask) pairs per example.
-- We do NOT pad here. Padding happens in the data collator at batch time.
+Supports two data sources:
+- "ultrafeedback": HuggingFaceH4/ultrafeedback_binarized (real human labels)
+- "gold_labeled": dataset relabeled by a strong RM (Path B / Gao et al. methodology)
 """
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Optional
 
-from datasets import Dataset, load_dataset
+from datasets import Dataset, load_dataset, load_from_disk
 
 
 def format_pair(
@@ -25,12 +22,8 @@ def format_pair(
     """Format one preference pair into tokenized chosen and rejected.
     
     Expects example to have 'chosen' and 'rejected' fields, each a list
-    of message dicts in the format used by HF chat templates:
-        [{"role": "user", "content": "..."},
-         {"role": "assistant", "content": "..."}]
-    
-    This is the format used by HuggingFaceH4/ultrafeedback_binarized.
-    Other datasets may need adapting.
+    of message dicts: [{"role": "user", ...}, {"role": "assistant", ...}].
+    Both ultrafeedback_binarized and our gold_labeled output use this format.
     """
     chosen_text = tokenizer.apply_chat_template(
         example["chosen"],
@@ -70,14 +63,7 @@ def load_ultrafeedback(
     n_train: Optional[int] = None,
     n_eval: Optional[int] = None,
 ) -> tuple[Dataset, Dataset]:
-    """Load and tokenize UltraFeedback Binarized.
-    
-    Args:
-        tokenizer: HF tokenizer for the base model.
-        max_length: max tokens per response (chosen or rejected).
-        n_train: if set, use only first n examples (for fast development).
-        n_eval: if set, use only first n eval examples.
-    """
+    """Load and tokenize UltraFeedback Binarized (real human labels)."""
     train = load_dataset(
         "HuggingFaceH4/ultrafeedback_binarized",
         split="train_prefs",
@@ -87,7 +73,6 @@ def load_ultrafeedback(
         split="test_prefs",
     )
     
-    # Allow skipping train tokenization for eval-only contexts.
     skip_train = n_train is not None and n_train == 0
     
     if not skip_train and n_train is not None:
@@ -96,7 +81,6 @@ def load_ultrafeedback(
         eval_ = eval_.select(range(min(n_eval, len(eval_))))
     
     if skip_train:
-        # Return an empty Dataset for the train slot; do not tokenize.
         train = train.select(range(0))
     else:
         train = train.map(
@@ -114,12 +98,75 @@ def load_ultrafeedback(
     return train, eval_
 
 
-def inspect_example(example: dict, tokenizer) -> None:
-    """Print a tokenized example for manual sanity-checking.
+def load_gold_labeled(
+    tokenizer,
+    dataset_path: str,
+    max_length: int = 1024,
+    n_train: Optional[int] = None,
+    n_eval: Optional[int] = None,
+    eval_fraction: float = 0.05,
+) -> tuple[Dataset, Dataset]:
+    """Load a gold-RM-relabeled dataset (produced by label_with_gold.py).
     
-    Look for: special tokens at start/end, no weird truncation,
-    chosen and rejected formatted identically except for content.
+    The gold-labeled dataset has a single split. We carve out a held-out
+    eval slice from the end of the dataset (eval_fraction of total).
+    
+    Args:
+        tokenizer: HF tokenizer for the proxy base model.
+        dataset_path: filesystem path where the gold-labeled dataset lives
+            (the directory written by label_with_gold.py).
+        max_length: max tokens per response.
+        n_train: cap train set size after the eval split is carved off.
+        n_eval: cap eval set size.
+        eval_fraction: fraction of the gold-labeled dataset to use as eval.
     """
+    if not Path(dataset_path).exists():
+        raise FileNotFoundError(
+            f"Gold-labeled dataset not found at {dataset_path}. "
+            f"Run `python -m src.label_with_gold --output_dir {dataset_path}` first."
+        )
+    
+    full = load_from_disk(dataset_path)
+    n_total = len(full)
+    n_eval_split = max(1, int(n_total * eval_fraction))
+    
+    # Last `n_eval_split` examples are held out as eval; the rest is train.
+    train = full.select(range(n_total - n_eval_split))
+    eval_ = full.select(range(n_total - n_eval_split, n_total))
+    
+    print(f"  Gold-labeled dataset: {n_total} total, "
+          f"{len(train)} train, {len(eval_)} eval (before caps)")
+    
+    # Apply size caps
+    skip_train = n_train is not None and n_train == 0
+    if not skip_train and n_train is not None:
+        train = train.select(range(min(n_train, len(train))))
+    if n_eval is not None:
+        eval_ = eval_.select(range(min(n_eval, len(eval_))))
+    
+    # Drop the metadata fields that would confuse remove_columns
+    relevant_cols = train.column_names
+    
+    if skip_train:
+        train = train.select(range(0))
+    else:
+        train = train.map(
+            lambda x: format_pair(x, tokenizer, max_length),
+            remove_columns=relevant_cols,
+            desc="Tokenizing train (gold)",
+        )
+    
+    eval_ = eval_.map(
+        lambda x: format_pair(x, tokenizer, max_length),
+        remove_columns=relevant_cols,
+        desc="Tokenizing eval (gold)",
+    )
+    
+    return train, eval_
+
+
+def inspect_example(example: dict, tokenizer) -> None:
+    """Print a tokenized example for manual sanity-checking."""
     print("=" * 60)
     print("CHOSEN")
     print("=" * 60)
