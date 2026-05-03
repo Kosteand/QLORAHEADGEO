@@ -2,14 +2,17 @@
 # To compare linear vs concave heads, run with:
 #   --activation_name ident          (linear baseline)
 #   --activation_name bounded_above  (recommended concave head)
-#   --activation_name gelu_bounded_above  (alternative concave)
-#   --activation_name bounded        (one-sided concavity, NOT globally concave)
+#
+# To switch between human-labeled and gold-labeled training:
+#   --dataset_source ultrafeedback    (real human labels)
+#   --dataset_source gold_labeled     (relabeled by Skywork)
 
 base_model_name: "Qwen/Qwen2.5-0.5B-Instruct"
 activation_name: "bounded_above"
 head_init_scale: 0.02
 head_init_bias: 0.0
-alpha_reg: 0.0   # L2 penalty on BoundedAbove alpha; try 0.01–0.1
+head_width: 32
+head_intermediate_size: null   # null -> use base hidden_size
 
 # LoRA
 lora_r: 8
@@ -25,17 +28,19 @@ lora_target_modules:
   - down_proj
 
 # Data
+dataset_source: "ultrafeedback"   # or "gold_labeled"
+gold_labeled_path: "./gold_labeled"   # only used if dataset_source: gold_labeled
 max_length: 1024
-n_train: null   # null = full UltraFeedback; set to 1000 for overfit test
+n_train: null
 n_eval: 200
 
 # Training
 output_dir: "./outputs/rm-qwen-0.5b-bounded_above"
 per_device_train_batch_size: 4
 per_device_eval_batch_size: 8
-gradient_accumulation_steps: 4   # effective batch 16
+gradient_accumulation_steps: 4
 num_train_epochs: 1
-learning_rate: 2.0e-4
+learning_rate: 5.0e-5
 lr_scheduler_type: cosine
 warmup_ratio: 0.03
 bf16: true
@@ -44,5 +49,8 @@ eval_steps: 25
 save_strategy: epoch
 seed: 42
 
+# Regularization
+alpha_reg: 0.0
+
 run_name: "rm-qwen-0.5b-bounded_above"
-report_to: "none"  # change to wandb for real runs
+report_to: "none"
