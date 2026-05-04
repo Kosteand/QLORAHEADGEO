@@ -1,15 +1,10 @@
 """
-Train a reward model with LoRA.
+Train a reward model with LoRA. Compatible with TRL 0.11.4.
 
 Regularizers:
-- alpha_reg: L2 on BoundedAbove's alpha (legacy, only fires if BoundedAbove is present).
-- head_reg_weight: weight on activation-specific .regularization_loss() methods.
-                   Currently used by GaussianActivation to penalize peak amplitude.
-- preact_reg: L2 penalty on |z|, the post-fc2 input to the activation.
-              Forces the MLP to keep preactivations small (near peak for
-              peaked activations; near origin for monotonic ones).
-              Combined with concave activations, this ensures the activation
-              operates on the data, not just at far-field probes.
+- alpha_reg: L2 on BoundedAbove's alpha (legacy).
+- head_reg_weight: weight on activation .regularization_loss() methods.
+- preact_reg: L2 on preactivation magnitude.
 """
 
 from __future__ import annotations
@@ -33,7 +28,6 @@ from .model import RewardModel, RewardModelConfig
 
 @dataclasses.dataclass
 class TrainConfig:
-    # Model
     base_model_name: str = "Qwen/Qwen2.5-0.5B-Instruct"
     activation_name: str = "bounded_above"
     head_init_scale: float = 0.02
@@ -41,7 +35,6 @@ class TrainConfig:
     head_width: int = 32
     head_intermediate_size: int | None = None
 
-    # LoRA
     lora_r: int = 8
     lora_alpha: int = 8
     lora_dropout: float = 0.05
@@ -50,19 +43,17 @@ class TrainConfig:
         "gate_proj", "up_proj", "down_proj",
     ])
 
-    # Data
     dataset_source: str = "ultrafeedback"
     gold_labeled_path: str = "./gold_labeled"
     max_length: int = 1024
     n_train: int | None = None
     n_eval: int = 200
 
-    # Training
     output_dir: str = "./outputs/rm-dev"
     per_device_train_batch_size: int = 4
     per_device_eval_batch_size: int = 8
     gradient_accumulation_steps: int = 4
-    num_train_epochs: int = 1
+    num_train_epochs: float = 1.0
     learning_rate: float = 2e-4
     lr_scheduler_type: str = "cosine"
     warmup_ratio: float = 0.03
@@ -72,17 +63,15 @@ class TrainConfig:
     save_strategy: str = "epoch"
     seed: int = 42
 
-    # Regularization
-    alpha_reg: float = 0.0          # legacy: L2 on BoundedAbove.alpha
-    head_reg_weight: float = 0.0    # weight on submodule .regularization_loss()
-    preact_reg: float = 0.0         # L2 on preactivation magnitude (post-fc2)
+    alpha_reg: float = 0.0
+    head_reg_weight: float = 0.0
+    preact_reg: float = 0.0
 
     run_name: str = "rm-dev"
     report_to: str = "none"
 
 
 def _module_regularization_loss(model):
-    """Sum .regularization_loss() over submodules that expose it."""
     first_param = next(model.parameters())
     total = torch.tensor(0.0, device=first_param.device, dtype=first_param.dtype)
     for submodule in model.modules():
@@ -93,8 +82,6 @@ def _module_regularization_loss(model):
 
 
 class ConcaveRewardTrainer(RewardTrainer):
-    """RewardTrainer with optional regularizers on the reward head."""
-
     def __init__(
         self,
         *args,
@@ -124,21 +111,16 @@ class ConcaveRewardTrainer(RewardTrainer):
             loss = loss + self.head_reg_weight * reg
 
         if self.preact_reg > 0.0:
-            # Forward the chosen and rejected through the model with
-            # return_preactivation=True. This is a second forward pass
-            # but it's the cleanest way to expose preactivations.
             z_chosen = model(
                 input_ids=inputs["input_ids_chosen"],
                 attention_mask=inputs["attention_mask_chosen"],
                 return_preactivation=True,
-            ).hidden_states  # (batch, head_width)
+            ).hidden_states
             z_rejected = model(
                 input_ids=inputs["input_ids_rejected"],
                 attention_mask=inputs["attention_mask_rejected"],
                 return_preactivation=True,
             ).hidden_states
-            # Penalize squared L2 norm of preactivation, averaged over
-            # batch and head_width.
             preact_penalty = (z_chosen.float().pow(2).mean()
                               + z_rejected.float().pow(2).mean()) * 0.5
             loss = loss + self.preact_reg * preact_penalty
@@ -276,13 +258,14 @@ def main():
         seed=cfg.seed,
     )
 
+    # TRL 0.11.4: uses tokenizer= (not processing_class=)
     trainer = ConcaveRewardTrainer(
         alpha_reg=cfg.alpha_reg,
         head_reg_weight=cfg.head_reg_weight,
         preact_reg=cfg.preact_reg,
         model=model,
         args=training_args,
-        processing_class=tokenizer,
+        tokenizer=tokenizer,
         train_dataset=train_ds,
         eval_dataset=eval_ds,
     )

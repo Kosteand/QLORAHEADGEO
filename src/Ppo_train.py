@@ -1,33 +1,19 @@
 """
-PPO training with proxy reward, no/small KL.
-
-Mirrors the PhD's RL figure for LLM RLHF: bounded reward without KL should
-behave well, while linear without KL should runaway. Tests this by training
-a policy via PPO against a frozen proxy RM, periodically saving checkpoints
-for offline gold-RM evaluation.
+PPO training with proxy reward for TRL 0.11.4.
 
 Run from project root:
-    python -m src.ppo_train \
-        --policy Qwen/Qwen2.5-0.5B-Instruct \
-        --proxy_checkpoint ./outputs/rm-ident-clean/final \
+    python -m src.Ppo_train \
+        --proxy_checkpoint ./outputs/rm-ident-cleanv2/final \
         --proxy_activation ident \
         --kl_coef 0.0 \
         --num_steps 200 \
         --output_dir ./outputs/ppo-ident-no-kl
-
-The output_dir contains:
-    - policy_step_K/  policy checkpoints at intervals
-    - proxy_log.json  per-step proxy reward stats
-    - run_config.json  the config used
-
-Then evaluate with src/ppo_eval_gold.py on the policy_step_K/ checkpoints.
 """
 
 from __future__ import annotations
 
 import argparse
 import dataclasses
-import inspect
 import json
 import os
 import time
@@ -51,21 +37,18 @@ from .model import RewardModel, RewardModelConfig
 
 @dataclasses.dataclass
 class PPORunConfig:
-    # Models
     policy_name: str = "Qwen/Qwen2.5-0.5B-Instruct"
     proxy_checkpoint: str = ""
     proxy_activation: str = "ident"
     
-    # Data
     prompts_dataset: str = "HuggingFaceH4/ultrafeedback_binarized"
     prompts_split: str = "train_prefs"
     n_train_prompts: int = 4000
     max_prompt_length: int = 512
     max_new_tokens: int = 256
     
-    # PPO
     num_steps: int = 200
-    kl_coef: float = 0.0  # KL penalty coefficient. 0 = no KL.
+    kl_coef: float = 0.0
     learning_rate: float = 1.41e-5
     batch_size: int = 16
     mini_batch_size: int = 4
@@ -74,23 +57,18 @@ class PPORunConfig:
     cliprange_value: float = 0.2
     vf_coef: float = 0.1
     
-    # Generation
     temperature: float = 1.0
     top_p: float = 1.0
     
-    # Logging
     output_dir: str = "./outputs/ppo-dev"
-    save_freq: int = 25  # save policy checkpoint every K PPO updates
+    save_freq: int = 25
     log_freq: int = 1
     
-    # Misc
     seed: int = 42
 
 
-def load_proxy_rm(checkpoint_dir: str, base_model_name: str, activation_name: str):
-    """Load a trained proxy RM (LoRA + concave/linear/gaussian head)."""
+def load_proxy_rm(checkpoint_dir, base_model_name, activation_name):
     print(f"Loading proxy RM: {checkpoint_dir} (activation={activation_name})")
-    
     tokenizer = AutoTokenizer.from_pretrained(base_model_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -111,7 +89,6 @@ def load_proxy_rm(checkpoint_dir: str, base_model_name: str, activation_name: st
 
 @torch.no_grad()
 def score_with_proxy(proxy_model, proxy_tokenizer, prompts, responses, max_length=1024):
-    """Score (prompt, response) pairs with the proxy RM."""
     formatted = []
     for prompt, response in zip(prompts, responses):
         msgs = [
@@ -122,11 +99,8 @@ def score_with_proxy(proxy_model, proxy_tokenizer, prompts, responses, max_lengt
         formatted.append(text)
     
     enc = proxy_tokenizer(
-        formatted,
-        return_tensors="pt",
-        padding=True,
-        truncation=True,
-        max_length=max_length,
+        formatted, return_tensors="pt", padding=True,
+        truncation=True, max_length=max_length,
     ).to(proxy_model.device)
     
     out = proxy_model(input_ids=enc.input_ids, attention_mask=enc.attention_mask)
@@ -135,7 +109,6 @@ def score_with_proxy(proxy_model, proxy_tokenizer, prompts, responses, max_lengt
 
 
 def build_ppo_dataset(tokenizer, dataset_name, split, n_prompts, max_prompt_length):
-    """Build a tokenized prompt dataset for PPO."""
     print(f"Loading prompts from {dataset_name}:{split}...")
     ds = load_dataset(dataset_name, split=split)
     ds = ds.select(range(min(n_prompts, len(ds))))
@@ -153,57 +126,9 @@ def build_ppo_dataset(tokenizer, dataset_name, split, n_prompts, max_prompt_leng
         }
     
     ds = ds.map(format_prompt, remove_columns=ds.column_names)
-    # output_all_columns=True keeps string columns (raw_prompt, query) accessible
-    # alongside the tensor input_ids
+    # Keep raw_prompt and query as strings while input_ids stays as tensor list
     ds.set_format(type="torch", columns=["input_ids"], output_all_columns=True)
     return ds
-
-
-def build_ppo_config(cfg: PPORunConfig) -> PPOConfig:
-    """Build a PPOConfig in a version-tolerant way.
-    
-    Different TRL versions have different argument names:
-    - 'ppo_epochs' vs 'num_ppo_epochs'
-    - 'kl_penalty', 'init_kl_coef', 'adap_kl_ctrl' present in older TRL only
-    
-    We inspect the signature to figure out what's accepted.
-    """
-    sig = inspect.signature(PPOConfig.__init__)
-    accepted = set(sig.parameters.keys())
-    
-    kwargs = {
-        "learning_rate": cfg.learning_rate,
-        "batch_size": cfg.batch_size,
-        "mini_batch_size": cfg.mini_batch_size,
-        "cliprange": cfg.cliprange,
-        "cliprange_value": cfg.cliprange_value,
-        "vf_coef": cfg.vf_coef,
-        "seed": cfg.seed,
-    }
-    
-    # Handle ppo_epochs naming
-    if "num_ppo_epochs" in accepted:
-        kwargs["num_ppo_epochs"] = cfg.ppo_epochs
-    elif "ppo_epochs" in accepted:
-        kwargs["ppo_epochs"] = cfg.ppo_epochs
-    
-    # KL handling — old TRL has these args, new TRL handles KL differently
-    if "init_kl_coef" in accepted:
-        kwargs["init_kl_coef"] = cfg.kl_coef
-    elif "kl_coef" in accepted:
-        kwargs["kl_coef"] = cfg.kl_coef
-    
-    if "adap_kl_ctrl" in accepted:
-        kwargs["adap_kl_ctrl"] = False
-    
-    if "kl_penalty" in accepted:
-        kwargs["kl_penalty"] = "kl"
-    
-    # Drop any kwargs that aren't accepted by this TRL version
-    final = {k: v for k, v in kwargs.items() if k in accepted}
-    
-    print(f"PPOConfig args used: {sorted(final.keys())}")
-    return PPOConfig(**final)
 
 
 def main():
@@ -246,7 +171,7 @@ def main():
     with open(out_dir / "run_config.json", "w") as f:
         json.dump(dataclasses.asdict(cfg), f, indent=2)
     
-    # ---- Load policy and ref ----
+    # Load policy and ref
     print(f"Loading policy: {cfg.policy_name}")
     tokenizer = AutoTokenizer.from_pretrained(cfg.policy_name)
     if tokenizer.pad_token is None:
@@ -263,22 +188,34 @@ def main():
         torch_dtype=torch.bfloat16,
     )
     
-    # ---- Load proxy RM ----
+    # Load proxy RM
     proxy_model, proxy_tokenizer = load_proxy_rm(
         cfg.proxy_checkpoint, cfg.policy_name, cfg.proxy_activation
     )
     
-    # ---- Build dataset ----
+    # Build dataset
     train_ds = build_ppo_dataset(
         tokenizer, cfg.prompts_dataset, cfg.prompts_split,
         cfg.n_train_prompts, cfg.max_prompt_length
     )
     
-    # ---- PPO config (version-tolerant) ----
-    ppo_config = build_ppo_config(cfg)
+    # PPO config (TRL 0.11.4 API - all args verified from inspect)
+    ppo_config = PPOConfig(
+        learning_rate=cfg.learning_rate,
+        batch_size=cfg.batch_size,
+        mini_batch_size=cfg.mini_batch_size,
+        ppo_epochs=cfg.ppo_epochs,
+        cliprange=cfg.cliprange,
+        cliprange_value=cfg.cliprange_value,
+        vf_coef=cfg.vf_coef,
+        init_kl_coef=cfg.kl_coef,
+        adap_kl_ctrl=False,
+        kl_penalty="kl",
+        seed=cfg.seed,
+        log_with=None,  # disable wandb/etc
+    )
     
     def collator(data):
-        # Preserves all keys, both tensors and strings
         return {key: [d[key] for d in data] for key in data[0]}
     
     ppo_trainer = PPOTrainer(
@@ -290,7 +227,6 @@ def main():
         data_collator=collator,
     )
     
-    # ---- PPO loop ----
     proxy_log = []
     gen_kwargs = {
         "max_new_tokens": cfg.max_new_tokens,
@@ -307,8 +243,7 @@ def main():
         if step >= cfg.num_steps:
             break
         
-        # Convert input_ids to tensors on device
-        # PPOTrainer expects a list of 1D tensors (not batched)
+        # Convert input_ids to list of 1D tensors on device
         query_tensors = []
         for ids in batch["input_ids"]:
             if isinstance(ids, torch.Tensor):
@@ -324,18 +259,16 @@ def main():
             **gen_kwargs,
         )
         
-        # Decode for scoring
         responses_text = tokenizer.batch_decode(response_tensors, skip_special_tokens=True)
         
-        # Get prompts for scoring -- raw_prompt should be available via output_all_columns
+        # Get raw_prompt for scoring
         if "raw_prompt" in batch:
             prompts_for_scoring = batch["raw_prompt"]
         else:
-            # Fallback: decode from query_tensors and strip chat template
+            # Fallback: decode and strip chat template
             prompts_for_scoring = []
             for qt in query_tensors:
                 decoded = tokenizer.decode(qt, skip_special_tokens=True)
-                # Rough chat template strip for Qwen
                 if "user\n" in decoded:
                     decoded = decoded.split("user\n", 1)[1]
                     if "assistant" in decoded:
@@ -353,11 +286,10 @@ def main():
         try:
             stats = ppo_trainer.step(query_tensors, response_tensors, rewards_list)
         except Exception as e:
-            print(f"PPO step failed: {e}")
+            print(f"PPO step failed at step {step}: {e}")
             print("Continuing to next batch...")
             continue
         
-        # Log
         log_entry = {
             "step": step,
             "proxy_mean": float(rewards.mean().item()),
@@ -374,19 +306,16 @@ def main():
                   f"kl={log_entry['kl']:7.3f}  "
                   f"elapsed={log_entry['elapsed_s']:.0f}s")
         
-        # Save proxy log periodically
         if step % 5 == 0:
             with open(out_dir / "proxy_log.json", "w") as f:
                 json.dump(proxy_log, f, indent=2)
         
-        # Save policy checkpoint periodically
         if (step + 1) % cfg.save_freq == 0:
             ckpt_dir = out_dir / f"policy_step_{step + 1}"
             print(f"  Saving policy to {ckpt_dir}")
             policy_model.save_pretrained(str(ckpt_dir))
             tokenizer.save_pretrained(str(ckpt_dir))
     
-    # Final save
     with open(out_dir / "proxy_log.json", "w") as f:
         json.dump(proxy_log, f, indent=2)
     
@@ -395,7 +324,6 @@ def main():
     tokenizer.save_pretrained(str(final_dir))
     
     print(f"PPO done. Total time: {time.time() - t_start:.1f}s")
-    print(f"Outputs in {out_dir}")
 
 
 if __name__ == "__main__":
