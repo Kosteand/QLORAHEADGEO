@@ -224,19 +224,28 @@ def main():
     )
     
     # ---- PPO config ----
-    ppo_config = PPOConfig(
-        learning_rate=cfg.learning_rate,
-        batch_size=cfg.batch_size,
-        mini_batch_size=cfg.mini_batch_size,
-        ppo_epochs=cfg.ppo_epochs,
-        kl_penalty="kl",  # standard KL
-        init_kl_coef=cfg.kl_coef,
-        adap_kl_ctrl=False,  # don't auto-adjust KL; we want to test fixed values
-        cliprange=cfg.cliprange,
-        cliprange_value=cfg.cliprange_value,
-        vf_coef=cfg.vf_coef,
-        seed=cfg.seed,
-    )
+    # Handle TRL API version differences
+    ppo_kwargs = {
+        "learning_rate": cfg.learning_rate,
+        "batch_size": cfg.batch_size,
+        "mini_batch_size": cfg.mini_batch_size,
+        "kl_penalty": "kl",
+        "init_kl_coef": cfg.kl_coef,
+        "adap_kl_ctrl": False,
+        "cliprange": cfg.cliprange,
+        "cliprange_value": cfg.cliprange_value,
+        "vf_coef": cfg.vf_coef,
+        "seed": cfg.seed,
+    }
+    # Try newer name first, then older
+    import inspect
+    sig = inspect.signature(PPOConfig.__init__)
+    if "num_ppo_epochs" in sig.parameters:
+        ppo_kwargs["num_ppo_epochs"] = cfg.ppo_epochs
+    elif "ppo_epochs" in sig.parameters:
+        ppo_kwargs["ppo_epochs"] = cfg.ppo_epochs
+    
+    ppo_config = PPOConfig(**ppo_kwargs)
     
     def collator(data):
         return {key: [d[key] for d in data] for key in data[0]}
