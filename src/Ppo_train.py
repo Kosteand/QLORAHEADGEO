@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import inspect
 import json
 import os
 import time
@@ -37,7 +38,7 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import torch
 from datasets import load_dataset
 from peft import PeftModel
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoTokenizer
 from trl import (
     AutoModelForCausalLMWithValueHead,
     PPOConfig,
@@ -59,7 +60,6 @@ class PPORunConfig:
     prompts_dataset: str = "HuggingFaceH4/ultrafeedback_binarized"
     prompts_split: str = "train_prefs"
     n_train_prompts: int = 4000
-    n_eval_prompts: int = 100
     max_prompt_length: int = 512
     max_new_tokens: int = 256
     
@@ -104,7 +104,6 @@ def load_proxy_rm(checkpoint_dir: str, base_model_name: str, activation_name: st
     
     model = PeftModel.from_pretrained(base_rm, checkpoint_dir)
     model = model.cuda().eval()
-    # Freeze
     for p in model.parameters():
         p.requires_grad = False
     return model, tokenizer
@@ -112,7 +111,7 @@ def load_proxy_rm(checkpoint_dir: str, base_model_name: str, activation_name: st
 
 @torch.no_grad()
 def score_with_proxy(proxy_model, proxy_tokenizer, prompts, responses, max_length=1024):
-    """Score (prompt, response) pairs with the proxy RM. Returns tensor of rewards."""
+    """Score (prompt, response) pairs with the proxy RM."""
     formatted = []
     for prompt, response in zip(prompts, responses):
         msgs = [
@@ -136,20 +135,75 @@ def score_with_proxy(proxy_model, proxy_tokenizer, prompts, responses, max_lengt
 
 
 def build_ppo_dataset(tokenizer, dataset_name, split, n_prompts, max_prompt_length):
-    """Build a tokenized prompt dataset for PPO. Each example is a tokenized chat-format prompt."""
+    """Build a tokenized prompt dataset for PPO."""
     print(f"Loading prompts from {dataset_name}:{split}...")
     ds = load_dataset(dataset_name, split=split)
     ds = ds.select(range(min(n_prompts, len(ds))))
     
     def format_prompt(ex):
         msgs = [{"role": "user", "content": ex["prompt"]}]
-        text = tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+        text = tokenizer.apply_chat_template(
+            msgs, tokenize=False, add_generation_prompt=True
+        )
         ids = tokenizer(text, truncation=True, max_length=max_prompt_length)["input_ids"]
-        return {"input_ids": ids, "query": text, "raw_prompt": ex["prompt"]}
+        return {
+            "input_ids": ids,
+            "query": text,
+            "raw_prompt": ex["prompt"],
+        }
     
     ds = ds.map(format_prompt, remove_columns=ds.column_names)
-    ds.set_format(type="torch")
+    # output_all_columns=True keeps string columns (raw_prompt, query) accessible
+    # alongside the tensor input_ids
+    ds.set_format(type="torch", columns=["input_ids"], output_all_columns=True)
     return ds
+
+
+def build_ppo_config(cfg: PPORunConfig) -> PPOConfig:
+    """Build a PPOConfig in a version-tolerant way.
+    
+    Different TRL versions have different argument names:
+    - 'ppo_epochs' vs 'num_ppo_epochs'
+    - 'kl_penalty', 'init_kl_coef', 'adap_kl_ctrl' present in older TRL only
+    
+    We inspect the signature to figure out what's accepted.
+    """
+    sig = inspect.signature(PPOConfig.__init__)
+    accepted = set(sig.parameters.keys())
+    
+    kwargs = {
+        "learning_rate": cfg.learning_rate,
+        "batch_size": cfg.batch_size,
+        "mini_batch_size": cfg.mini_batch_size,
+        "cliprange": cfg.cliprange,
+        "cliprange_value": cfg.cliprange_value,
+        "vf_coef": cfg.vf_coef,
+        "seed": cfg.seed,
+    }
+    
+    # Handle ppo_epochs naming
+    if "num_ppo_epochs" in accepted:
+        kwargs["num_ppo_epochs"] = cfg.ppo_epochs
+    elif "ppo_epochs" in accepted:
+        kwargs["ppo_epochs"] = cfg.ppo_epochs
+    
+    # KL handling — old TRL has these args, new TRL handles KL differently
+    if "init_kl_coef" in accepted:
+        kwargs["init_kl_coef"] = cfg.kl_coef
+    elif "kl_coef" in accepted:
+        kwargs["kl_coef"] = cfg.kl_coef
+    
+    if "adap_kl_ctrl" in accepted:
+        kwargs["adap_kl_ctrl"] = False
+    
+    if "kl_penalty" in accepted:
+        kwargs["kl_penalty"] = "kl"
+    
+    # Drop any kwargs that aren't accepted by this TRL version
+    final = {k: v for k, v in kwargs.items() if k in accepted}
+    
+    print(f"PPOConfig args used: {sorted(final.keys())}")
+    return PPOConfig(**final)
 
 
 def main():
@@ -158,10 +212,8 @@ def main():
     parser.add_argument("--proxy_checkpoint", required=True)
     parser.add_argument("--proxy_activation", required=True,
                         choices=list(ACTIVATION_REGISTRY.keys()))
-    parser.add_argument("--kl_coef", type=float, default=0.0,
-                        help="KL penalty coefficient. 0 = no KL.")
-    parser.add_argument("--num_steps", type=int, default=200,
-                        help="Number of PPO updates.")
+    parser.add_argument("--kl_coef", type=float, default=0.0)
+    parser.add_argument("--num_steps", type=int, default=200)
     parser.add_argument("--n_train_prompts", type=int, default=4000)
     parser.add_argument("--max_new_tokens", type=int, default=256)
     parser.add_argument("--batch_size", type=int, default=16)
@@ -206,7 +258,6 @@ def main():
         torch_dtype=torch.bfloat16,
     )
     
-    # Reference model (used for KL computation)
     ref_model = AutoModelForCausalLMWithValueHead.from_pretrained(
         cfg.policy_name,
         torch_dtype=torch.bfloat16,
@@ -223,31 +274,11 @@ def main():
         cfg.n_train_prompts, cfg.max_prompt_length
     )
     
-    # ---- PPO config ----
-    # Handle TRL API version differences
-    ppo_kwargs = {
-        "learning_rate": cfg.learning_rate,
-        "batch_size": cfg.batch_size,
-        "mini_batch_size": cfg.mini_batch_size,
-        "kl_penalty": "kl",
-        "init_kl_coef": cfg.kl_coef,
-        "adap_kl_ctrl": False,
-        "cliprange": cfg.cliprange,
-        "cliprange_value": cfg.cliprange_value,
-        "vf_coef": cfg.vf_coef,
-        "seed": cfg.seed,
-    }
-    # Try newer name first, then older
-    import inspect
-    sig = inspect.signature(PPOConfig.__init__)
-    if "num_ppo_epochs" in sig.parameters:
-        ppo_kwargs["num_ppo_epochs"] = cfg.ppo_epochs
-    elif "ppo_epochs" in sig.parameters:
-        ppo_kwargs["ppo_epochs"] = cfg.ppo_epochs
-    
-    ppo_config = PPOConfig(**ppo_kwargs)
+    # ---- PPO config (version-tolerant) ----
+    ppo_config = build_ppo_config(cfg)
     
     def collator(data):
+        # Preserves all keys, both tensors and strings
         return {key: [d[key] for d in data] for key in data[0]}
     
     ppo_trainer = PPOTrainer(
@@ -276,8 +307,15 @@ def main():
         if step >= cfg.num_steps:
             break
         
-        query_tensors = [torch.tensor(ids).to(ppo_trainer.accelerator.device)
-                         for ids in batch["input_ids"]]
+        # Convert input_ids to tensors on device
+        # PPOTrainer expects a list of 1D tensors (not batched)
+        query_tensors = []
+        for ids in batch["input_ids"]:
+            if isinstance(ids, torch.Tensor):
+                t = ids.to(ppo_trainer.accelerator.device)
+            else:
+                t = torch.tensor(ids, device=ppo_trainer.accelerator.device)
+            query_tensors.append(t)
         
         # Generate responses
         response_tensors = ppo_trainer.generate(
@@ -289,15 +327,35 @@ def main():
         # Decode for scoring
         responses_text = tokenizer.batch_decode(response_tensors, skip_special_tokens=True)
         
+        # Get prompts for scoring -- raw_prompt should be available via output_all_columns
+        if "raw_prompt" in batch:
+            prompts_for_scoring = batch["raw_prompt"]
+        else:
+            # Fallback: decode from query_tensors and strip chat template
+            prompts_for_scoring = []
+            for qt in query_tensors:
+                decoded = tokenizer.decode(qt, skip_special_tokens=True)
+                # Rough chat template strip for Qwen
+                if "user\n" in decoded:
+                    decoded = decoded.split("user\n", 1)[1]
+                    if "assistant" in decoded:
+                        decoded = decoded.split("assistant", 1)[0]
+                prompts_for_scoring.append(decoded.strip())
+        
         # Score with proxy RM
         rewards = score_with_proxy(
             proxy_model, proxy_tokenizer,
-            batch["raw_prompt"], responses_text,
+            prompts_for_scoring, responses_text,
         )
         rewards_list = [r for r in rewards]
         
         # PPO step
-        stats = ppo_trainer.step(query_tensors, response_tensors, rewards_list)
+        try:
+            stats = ppo_trainer.step(query_tensors, response_tensors, rewards_list)
+        except Exception as e:
+            print(f"PPO step failed: {e}")
+            print("Continuing to next batch...")
+            continue
         
         # Log
         log_entry = {
@@ -314,15 +372,14 @@ def main():
         if step % cfg.log_freq == 0:
             print(f"step {step:4d}  proxy={log_entry['proxy_mean']:7.3f} "
                   f"kl={log_entry['kl']:7.3f}  "
-                  f"policy_loss={log_entry['policy_loss']:7.3f}  "
                   f"elapsed={log_entry['elapsed_s']:.0f}s")
         
-        # Save proxy log
+        # Save proxy log periodically
         if step % 5 == 0:
             with open(out_dir / "proxy_log.json", "w") as f:
                 json.dump(proxy_log, f, indent=2)
         
-        # Save policy checkpoint
+        # Save policy checkpoint periodically
         if (step + 1) % cfg.save_freq == 0:
             ckpt_dir = out_dir / f"policy_step_{step + 1}"
             print(f"  Saving policy to {ckpt_dir}")
