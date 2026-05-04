@@ -276,8 +276,8 @@ def main():
     parser.add_argument("--proxy_checkpoint", default=None)
     parser.add_argument("--proxy_base_model", default="Qwen/Qwen2.5-0.5B-Instruct")
     parser.add_argument("--proxy_activation", default=None,
-                        choices=[None, "ident", "bounded", "bounded_above",
-                                 "gelu_bounded_above", "gaussian"])
+                        choices=[None, "ident", "bounded", "bounded_above", "gelu_bounded_above", "gaussian", "quadratic", "p_linear_bounded_above"]
+    )
     parser.add_argument("--gold_dtype", choices=["bf16", "int4"], default="bf16")
     parser.add_argument("--batch_size", type=int, default=None,
                         help="Batch size; defaults to 16 for proxy, 4 for gold.")
