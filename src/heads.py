@@ -1,23 +1,15 @@
 """
-Reward heads of the form:
-    r(h) = mean_k(phi(fc2(leaky_relu(fc1(h))))) + b_out
+Reward heads matching the collaborator's RL implementation.
 
-Activations:
-    Ident:         phi(z) = z. Linear baseline.
-    BoundedAbove:  phi(z) = alpha * log_sigmoid(z). Strictly concave, monotonic, ceiling at 0.
-    Bounded:       phi(z) = alpha * tanh(z). Bounded, one-sided concave.
-    GeluBoundedAbove: phi(z) = -alpha * GELU(z). Approx peaked but with non-monotonic region.
-    
-    GaussianActivation: phi(z) = b * exp(-a*z^2). Peaked at z=0, exponential decay both sides.
-    QuadraticActivation: phi(z) = -alpha * z^2. Peaked at z=0, quadratic decay (sharper).
-    PLinearBoundedAbove: phi(z) = -alpha * |z|. Peaked at z=0, linear decay (sharpest).
+Key differences from previous version:
+- Activations have PER-DIMENSION parameters (vector instead of scalar).
+  Each output channel has its own peak shape.
+  This matches worldModels3.py exactly.
 
-Geometric hierarchy:
-    1. Linear: unbounded ascent in direction w.
-    2. Monotonic-bounded (bounded_above, bounded): ascent direction with ceiling.
-    3. Peaked (gaussian, quadratic, p_linear): no ascent direction, decreases away from peak.
-    
-    Within peaked: gaussian is smoothest, quadratic is sharper, p_linear is sharpest.
+Architecture:
+    r(h) = mean_k(phi_k(fc2(LeakyReLU(fc1(h))))) + b_out
+
+where each phi_k can have a different peak/curvature for each k.
 """
 
 from __future__ import annotations
@@ -28,89 +20,76 @@ import torch.nn.functional as F
 
 
 class Ident(nn.Module):
-    """phi(z) = z. Linear baseline."""
-    def __init__(self):
+    """phi(z) = z."""
+    def __init__(self, dimensionality: int = None):
         super().__init__()
     def forward(self, x):
         return x
 
 
 class BoundedAbove(nn.Module):
-    """phi(z) = alpha * log_sigmoid(z). Concave, monotonic, ceiling at 0."""
-    def __init__(self):
+    """phi(z) = alpha * log_sigmoid(z), alpha PER-DIMENSION."""
+    def __init__(self, dimensionality: int):
         super().__init__()
-        self.a = nn.Parameter(torch.tensor([-3.0]))
+        self.a = nn.Parameter(torch.rand(dimensionality))
     def forward(self, x):
         return F.softplus(self.a) * F.logsigmoid(x)
-    @property
-    def alpha(self):
-        return F.softplus(self.a)
 
 
 class GaussianActivation(nn.Module):
-    """phi(z) = b * exp(-a*z^2). Strictly concave, peaked at z=0, exponential decay.
+    """phi(z) = b * exp(-a*z^2). PER-DIMENSION a, b.
     
-    The smoothest of the peaked activations. Far from the peak, gradient
-    decays exponentially -- the optimizer sees little signal to push out
-    of the peak region.
+    Matches worldModels3.py's GaussianActivation exactly.
+    Each channel has its own width (a) and amplitude (b).
     """
-    def __init__(self):
+    def __init__(self, dimensionality: int):
         super().__init__()
-        self.a = nn.Parameter(torch.rand(1))
-        self.b = nn.Parameter(torch.rand(1))
+        self.a = nn.Parameter(torch.rand(dimensionality))
+        self.b = nn.Parameter(torch.rand(dimensionality))
     def forward(self, x):
-        return F.softplus(self.b) * torch.exp(-F.softplus(self.a) * x.square())
+        return F.softplus(self.b) * torch.exp(-F.softplus(self.a) * torch.square(x))
     def regularization_loss(self):
         return F.softplus(self.b).square().mean()
 
 
 class QuadraticActivation(nn.Module):
-    """phi(z) = -alpha * z^2. Peaked at z=0, quadratic decay.
-    
-    Globally concave (Hessian = -2*alpha < 0). Sharper than Gaussian:
-    gradient grows linearly with |z|, so the optimizer sees stronger
-    signal to keep z small. Unbounded below: phi -> -inf as |z| -> inf.
-    
-    No saturation = no "all bad responses look equally bad" failure mode.
-    """
-    def __init__(self):
+    """phi(z) = -alpha * z^2. PER-DIMENSION alpha."""
+    def __init__(self, dimensionality: int):
         super().__init__()
-        self.a = nn.Parameter(torch.rand(1))
+        self.a = nn.Parameter(torch.rand(dimensionality))
     def forward(self, x):
-        return -F.softplus(self.a) * x.square()
+        return -F.softplus(self.a) * torch.square(x)
+
+
+class BoundedActivation(nn.Module):
+    """phi(z) = alpha * tanh(z). PER-DIMENSION alpha."""
+    def __init__(self, dimensionality: int):
+        super().__init__()
+        self.a = nn.Parameter(torch.rand(dimensionality))
+    def forward(self, x):
+        return F.softplus(self.a) * torch.tanh(x)
 
 
 class PLinearBoundedAbove(nn.Module):
-    """phi(z) = -alpha * |z|. Peaked at z=0, linear decay.
-    
-    Concave (subdifferentiable at z=0). The sharpest peaked activation:
-    gradient is constant magnitude -alpha for z>0 and +alpha for z<0,
-    discontinuous at z=0. Spurious responses far from peak get strongly
-    penalized regardless of how far.
-    """
-    def __init__(self):
+    """phi(z) = -alpha * |z|. PER-DIMENSION alpha."""
+    def __init__(self, dimensionality: int):
         super().__init__()
-        self.a = nn.Parameter(torch.rand(1))
+        self.a = nn.Parameter(torch.rand(dimensionality))
     def forward(self, x):
-        return -F.softplus(self.a) * x.abs()
+        return -F.softplus(self.a) * torch.abs(x)
 
 
 class GeluBoundedAbove(nn.Module):
-    """phi(z) = -alpha * GELU(z). Approximately peaked, non-monotonic."""
-    def __init__(self):
+    """phi(z) = -alpha * GELU(z). PER-DIMENSION alpha."""
+    def __init__(self, dimensionality: int):
         super().__init__()
-        self.a = nn.Parameter(torch.rand(1))
+        self.a = nn.Parameter(torch.rand(dimensionality))
     def forward(self, x):
         return -F.softplus(self.a) * F.gelu(x)
 
 
-class Bounded(nn.Module):
-    """phi(z) = alpha * tanh(z). Monotonic, bounded."""
-    def __init__(self):
-        super().__init__()
-        self.a = nn.Parameter(torch.rand(1))
-    def forward(self, x):
-        return F.softplus(self.a) * torch.tanh(x)
+# Aliases for backward compat
+Bounded = BoundedActivation
 
 
 # ---------- Registry and metadata ----------
@@ -122,7 +101,7 @@ ACTIVATION_REGISTRY: dict[str, type] = {
     "quadratic": QuadraticActivation,
     "p_linear_bounded_above": PLinearBoundedAbove,
     "gelu_bounded_above": GeluBoundedAbove,
-    "bounded": Bounded,
+    "bounded": BoundedActivation,
 }
 
 GLOBALLY_CONCAVE: dict[str, bool] = {
@@ -140,7 +119,7 @@ STRICTLY_CONCAVE: dict[str, bool] = {
     "bounded_above": True,
     "gaussian": True,
     "quadratic": True,
-    "p_linear_bounded_above": False,  # affine on each side, not strictly concave
+    "p_linear_bounded_above": False,
     "gelu_bounded_above": False,
     "bounded": False,
 }
@@ -169,7 +148,11 @@ PEAKED: dict[str, bool] = {
 # ---------- The head module ----------
 
 class RewardHead(nn.Module):
-    """Reward head: Linear → LeakyReLU → Linear → Activation → mean → +bias."""
+    """Reward head: Linear → LeakyReLU → Linear → Activation → mean → +bias.
+    
+    Now passes head_width as `dimensionality` to the activation, matching
+    the RL setup where each output channel has its own activation parameters.
+    """
 
     def __init__(
         self,
@@ -193,7 +176,9 @@ class RewardHead(nn.Module):
 
         self.fc1 = nn.Linear(hidden_size, self.intermediate_size)
         self.fc2 = nn.Linear(self.intermediate_size, head_width)
-        self.activation = ACTIVATION_REGISTRY[activation_name]()
+        # Activation gets head_width as dimensionality so each output
+        # channel has its own activation parameters.
+        self.activation = ACTIVATION_REGISTRY[activation_name](dimensionality=head_width)
         self.output_bias = nn.Parameter(torch.tensor(float(init_bias)))
 
         nn.init.normal_(self.fc1.weight, std=init_scale)
